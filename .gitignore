@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Model weights and generated artifacts
+*.pt
+*.onnx
+*.engine
+*.tflite
+outputs/*
+!outputs/.gitkeep
+samples/*
+!samples/.gitkeep
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Environment
+.env

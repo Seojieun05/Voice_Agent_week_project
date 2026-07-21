@@ -1,0 +1,217 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+from ..signals import (
+    HsvSignalStateClassifier,
+    ImageArray,
+    SignalStateClassifier,
+    SignalStateResult,
+)
+from ..types import AnalysisResult, Detection, SignalState
+
+
+@dataclass(slots=True)
+class _SignalHistory:
+    confirmed_state: SignalState | None = None
+    candidate_state: SignalState | None = None
+    candidate_frames: int = 0
+    confirmed_frames: int = 0
+    last_frame_index: int | None = None
+
+
+class TrafficLightAnalyzer:
+    """Stabilize conservative HSV observations independently for each stable ID."""
+
+    def __init__(
+        self,
+        classifier: SignalStateClassifier | None = None,
+        *,
+        minimum_confirmed_frames: int = 3,
+        minimum_detection_confidence: float = 0.2,
+        enabled: bool = True,
+    ) -> None:
+        if (
+            not isinstance(minimum_confirmed_frames, int)
+            or isinstance(minimum_confirmed_frames, bool)
+            or minimum_confirmed_frames < 1
+        ):
+            raise ValueError("minimum_confirmed_frames must be a positive integer")
+        if (
+            not math.isfinite(minimum_detection_confidence)
+            or not 0.0 <= minimum_detection_confidence <= 1.0
+        ):
+            raise ValueError(
+                "minimum_detection_confidence must be finite and between 0 and 1"
+            )
+        self.minimum_confirmed_frames = minimum_confirmed_frames
+        self.minimum_detection_confidence = minimum_detection_confidence
+        self.enabled = enabled
+        self.classifier = (
+            (classifier if classifier is not None else HsvSignalStateClassifier())
+            if enabled
+            else None
+        )
+        self._history_by_stable_id: dict[str, _SignalHistory] = {}
+
+    @staticmethod
+    def _as_signal_state(value: object) -> SignalState:
+        try:
+            return SignalState(value)
+        except (TypeError, ValueError):
+            return SignalState.UNKNOWN
+
+    @staticmethod
+    def _evidence(
+        result: SignalStateResult | None,
+    ) -> tuple[SignalState, float, float, float, float]:
+        if result is None:
+            return SignalState.UNKNOWN, 0.0, 0.0, 0.0, 0.0
+        return (
+            TrafficLightAnalyzer._as_signal_state(result.state),
+            float(result.confidence),
+            float(result.red_ratio),
+            float(result.green_ratio),
+            float(getattr(result, "yellow_ratio", 0.0)),
+        )
+
+    def _observe(
+        self,
+        history: _SignalHistory,
+        observed_state: SignalState,
+    ) -> tuple[SignalState, SignalState | None, bool, bool]:
+        if observed_state is SignalState.UNKNOWN:
+            history.candidate_state = None
+            history.candidate_frames = 0
+            history.confirmed_frames = 0
+            return SignalState.UNKNOWN, None, False, True
+
+        if history.confirmed_state is None:
+            if history.candidate_state is observed_state:
+                history.candidate_frames += 1
+            else:
+                history.candidate_state = observed_state
+                history.candidate_frames = 1
+            if history.candidate_frames < self.minimum_confirmed_frames:
+                return SignalState.UNKNOWN, None, False, True
+
+            history.confirmed_state = observed_state
+            history.confirmed_frames = history.candidate_frames
+            history.candidate_state = None
+            history.candidate_frames = 0
+            return observed_state, None, False, False
+
+        if observed_state is history.confirmed_state:
+            history.candidate_state = None
+            history.candidate_frames = 0
+            history.confirmed_frames += 1
+            return history.confirmed_state, None, False, False
+
+        history.confirmed_frames = 0
+        if history.candidate_state is observed_state:
+            history.candidate_frames += 1
+        else:
+            history.candidate_state = observed_state
+            history.candidate_frames = 1
+        if history.candidate_frames < self.minimum_confirmed_frames:
+            return history.confirmed_state, None, False, True
+
+        previous_state = history.confirmed_state
+        history.confirmed_state = observed_state
+        history.confirmed_frames = history.candidate_frames
+        history.candidate_state = None
+        history.candidate_frames = 0
+        return observed_state, previous_state, True, False
+
+    @staticmethod
+    def _start_frame(history: _SignalHistory, frame_index: int) -> bool:
+        """Break candidate streaks unless this observation is the next video frame."""
+        is_consecutive = (
+            history.last_frame_index is None or frame_index == history.last_frame_index + 1
+        )
+        if not is_consecutive:
+            history.candidate_state = None
+            history.candidate_frames = 0
+            history.confirmed_frames = 0
+        history.last_frame_index = frame_index
+        return is_consecutive
+
+    def analyze(
+        self,
+        detection: Detection,
+        *,
+        stable_id: str,
+        crop: ImageArray | None = None,
+        precomputed_signal_result: SignalStateResult | None = None,
+    ) -> AnalysisResult:
+        result = precomputed_signal_result
+        disabled_reason: str | None = None
+        try:
+            detection_confidence = float(detection.confidence)
+        except (TypeError, ValueError):
+            detection_confidence = 0.0
+        detection_is_reliable = (
+            math.isfinite(detection_confidence)
+            and detection_confidence >= self.minimum_detection_confidence
+        )
+        if not self.enabled:
+            result = None
+            disabled_reason = "signal_state_analysis_disabled"
+        elif not detection_is_reliable:
+            result = None
+            disabled_reason = "low_detection_confidence"
+        elif result is None and crop is None:
+            disabled_reason = "signal_crop_unavailable"
+        elif result is None:
+            if self.classifier is None:  # Defensive: enabled analyzers always have one.
+                disabled_reason = "signal_classifier_unavailable"
+            else:
+                result = self.classifier.classify(crop)
+
+        observed, raw_confidence, red_ratio, green_ratio, yellow_ratio = self._evidence(result)
+        history = self._history_by_stable_id.setdefault(stable_id, _SignalHistory())
+        observations_are_consecutive = self._start_frame(history, detection.frame_index)
+        state, previous_state, changed, is_uncertain = self._observe(
+            history,
+            observed,
+        )
+        attributes: dict[str, object] = {
+            "detection_confidence": detection_confidence,
+            "minimum_detection_confidence": self.minimum_detection_confidence,
+            "observed_state": observed.value,
+            "signal_state_confidence": raw_confidence,
+            "red_ratio": red_ratio,
+            "green_ratio": green_ratio,
+            "yellow_ratio": yellow_ratio,
+            "confirmed_frames": history.confirmed_frames,
+            "candidate_state": (
+                history.candidate_state.value if history.candidate_state is not None else None
+            ),
+            "candidate_frames": history.candidate_frames,
+            "observations_are_consecutive": observations_are_consecutive,
+            "previous_state": previous_state.value if previous_state is not None else None,
+            "changed": changed,
+            "class_name": detection.class_name,
+            "signal_type": "UNKNOWN",
+            "signal_type_is_uncertain": True,
+        }
+        if disabled_reason is not None:
+            attributes["reason"] = disabled_reason
+
+        confidence = raw_confidence if not is_uncertain else 0.0
+        return AnalysisResult(
+            object_type="traffic_light",
+            stable_id=stable_id,
+            state=state.value,
+            confidence=confidence,
+            attributes=attributes,
+            is_uncertain=is_uncertain,
+        )
+
+    def reset(self, stable_id: str | None = None) -> None:
+        """Forget one signal's history, or all histories when no ID is supplied."""
+        if stable_id is None:
+            self._history_by_stable_id.clear()
+        else:
+            self._history_by_stable_id.pop(stable_id, None)
