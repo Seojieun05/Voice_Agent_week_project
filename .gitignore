@@ -17,6 +17,11 @@ outputs/*
 !outputs/.gitkeep
 samples/*
 !samples/.gitkeep
+visual_assistant_test_video_pack_builder/videos/*
+visual_assistant_test_video_pack_builder/*.zip
+visual_assistant_test_video_pack_builder/download_results.json
+datasets/public_baseline/review/*
+!datasets/public_baseline/review/.gitkeep
 
 # Editors / OS
 .vscode/

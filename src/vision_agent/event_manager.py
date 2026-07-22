@@ -4,6 +4,7 @@ import math
 from collections.abc import Mapping, Sequence
 from enum import Enum
 
+from .object_types import KIOSK_OBJECT_TYPES, SIGNAL_OBJECT_TYPES
 from .types import AnalysisEvent, AnalysisResult, SceneEvent
 
 OBJECT_APPEARED = "OBJECT_APPEARED"
@@ -97,10 +98,7 @@ class SceneEventManager:
     def _freeze(value: object) -> object:
         if isinstance(value, Mapping):
             return tuple(
-                sorted(
-                    (str(key), SceneEventManager._freeze(item))
-                    for key, item in value.items()
-                )
+                sorted((str(key), SceneEventManager._freeze(item)) for key, item in value.items())
             )
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
             return tuple(SceneEventManager._freeze(item) for item in value)
@@ -191,7 +189,7 @@ class SceneEventManager:
                 result,
                 result.attributes.get("motion_confidence", result.confidence),
             )
-        if object_type in {"traffic_light", "pedestrian_signal"}:
+        if object_type in SIGNAL_OBJECT_TYPES:
             # TrafficLightAnalyzer already rejects detector evidence below its
             # dedicated small-object threshold before producing a known state.
             detection_confidence = cls._detector_confidence(result)
@@ -249,7 +247,7 @@ class SceneEventManager:
         stable_id = _normalize_stable_id(result.stable_id)
         object_type = _normalize_object_type(result.object_type)
         if (
-            object_type == "kiosk"
+            object_type in KIOSK_OBJECT_TYPES
             and result.attributes.get("screen_is_confirmed", not result.is_uncertain) is True
         ):
             raw_fingerprint = result.attributes.get("screen_fingerprint")
@@ -470,9 +468,8 @@ class SceneEventManager:
 
         for stable_id, result in result_by_id.items():
             presence_state = self._presence_states.get(stable_id)
-            if (
-                presence_state != OBJECT_APPEARED
-                and (self.auto_presence or presence_state == _PENDING_APPEARED)
+            if presence_state != OBJECT_APPEARED and (
+                self.auto_presence or presence_state == _PENDING_APPEARED
             ):
                 presence_confidence = self._presence_confidence(result)
                 if presence_confidence >= self.minimum_presence_confidence:

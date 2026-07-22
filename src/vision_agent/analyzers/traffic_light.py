@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from ..object_types import AnalyzerKind, normalize_object_type, object_class_spec
 from ..signals import (
     HsvSignalStateClassifier,
     ImageArray,
@@ -42,9 +43,7 @@ class TrafficLightAnalyzer:
             not math.isfinite(minimum_detection_confidence)
             or not 0.0 <= minimum_detection_confidence <= 1.0
         ):
-            raise ValueError(
-                "minimum_detection_confidence must be finite and between 0 and 1"
-            )
+            raise ValueError("minimum_detection_confidence must be finite and between 0 and 1")
         self.minimum_confirmed_frames = minimum_confirmed_frames
         self.minimum_detection_confidence = minimum_detection_confidence
         self.enabled = enabled
@@ -176,6 +175,14 @@ class TrafficLightAnalyzer:
             history,
             observed,
         )
+        detected_object_type = normalize_object_type(detection.class_name)
+        class_spec = object_class_spec(detected_object_type)
+        object_type = (
+            detected_object_type
+            if class_spec.analyzer is AnalyzerKind.TRAFFIC_LIGHT
+            else "traffic_light"
+        )
+        signal_type_is_confirmed = class_spec.signal_type is not None and detection_is_reliable
         attributes: dict[str, object] = {
             "detection_confidence": detection_confidence,
             "minimum_detection_confidence": self.minimum_detection_confidence,
@@ -193,15 +200,15 @@ class TrafficLightAnalyzer:
             "previous_state": previous_state.value if previous_state is not None else None,
             "changed": changed,
             "class_name": detection.class_name,
-            "signal_type": "UNKNOWN",
-            "signal_type_is_uncertain": True,
+            "signal_type": class_spec.signal_type if signal_type_is_confirmed else "UNKNOWN",
+            "signal_type_is_uncertain": not signal_type_is_confirmed,
         }
         if disabled_reason is not None:
             attributes["reason"] = disabled_reason
 
         confidence = raw_confidence if not is_uncertain else 0.0
         return AnalysisResult(
-            object_type="traffic_light",
+            object_type=object_type,
             stable_id=stable_id,
             state=state.value,
             confidence=confidence,

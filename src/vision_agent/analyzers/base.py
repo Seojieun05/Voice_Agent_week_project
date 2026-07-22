@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-import re
 from typing import Protocol
 
+from ..object_types import normalize_object_type
 from ..signals import ImageArray, SignalStateResult
 from ..types import AnalysisResult, Detection
 
-
-def normalize_object_type(class_name: str) -> str:
-    """Normalize detector labels for routing without changing Detection itself."""
-    normalized = re.sub(r"[\s-]+", "_", class_name.strip().lower())
-    return normalized or "unknown"
+__all__ = ["ObjectAnalyzer", "normalize_object_type", "resolve_stable_id"]
 
 
 def resolve_stable_id(detection: Detection, stable_id: str | None) -> str:

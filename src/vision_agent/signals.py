@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 
+from .object_types import is_signal_object_type, normalize_object_type
 from .types import Detection, SignalState
 
 
@@ -251,12 +252,19 @@ class SignalTargetSelector:
     def _preferred(self, detection: Detection) -> bool:
         return _is_preferred_signal_box(detection.xyxy, self.config)
 
+    def is_signal_detection(self, detection: Detection) -> bool:
+        """Match model-independent signal names, with blank-name legacy fallback."""
+        return is_signal_object_type(detection.class_name) or (
+            not detection.class_name.strip()
+            and detection.class_id == self.config.traffic_light_class_id
+        )
+
     def select_indices(self, detections: list[Detection]) -> list[int]:
         """Return one selected traffic-light index per connected spatial group."""
         traffic_indices = [
             index
             for index, detection in enumerate(detections)
-            if detection.class_id == self.config.traffic_light_class_id
+            if self.is_signal_detection(detection)
         ]
         groups: list[list[int]] = []
         for detection_index in traffic_indices:
@@ -264,7 +272,9 @@ class SignalTargetSelector:
                 group_index
                 for group_index, group in enumerate(groups)
                 if any(
-                    _boxes_belong_to_same_signal(
+                    normalize_object_type(detections[detection_index].class_name)
+                    == normalize_object_type(detections[other_index].class_name)
+                    and _boxes_belong_to_same_signal(
                         detections[detection_index].xyxy,
                         detections[other_index].xyxy,
                         self.config,

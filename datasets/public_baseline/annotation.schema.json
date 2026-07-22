@@ -1,0 +1,352 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "annotation.schema.json",
+  "title": "Voice Agent public baseline annotation",
+  "description": "Human-reviewed frame-level ground truth. Model output must never be used to populate this document.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "video_id",
+    "review_status",
+    "video_metadata",
+    "objects",
+    "narration_constraints"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "video_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "review_status": {
+      "enum": [
+        "needs_manual_review",
+        "reviewed"
+      ]
+    },
+    "video_metadata": {
+      "$ref": "#/$defs/video_metadata"
+    },
+    "objects": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/object_annotation"
+      }
+    },
+    "narration_constraints": {
+      "$ref": "#/$defs/narration_constraints"
+    },
+    "review_notes": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "$defs": {
+    "video_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fps",
+        "frame_count",
+        "width",
+        "height"
+      ],
+      "properties": {
+        "fps": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "exclusiveMinimum": 0
+        },
+        "frame_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "width": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "height": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        }
+      }
+    },
+    "frame_range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start_frame",
+        "end_frame"
+      ],
+      "properties": {
+        "start_frame": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_frame": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "signal_state": {
+      "enum": [
+        "RED",
+        "GREEN",
+        "YELLOW",
+        "OFF",
+        "UNKNOWN"
+      ]
+    },
+    "signal_state_interval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start_frame",
+        "end_frame",
+        "state"
+      ],
+      "properties": {
+        "start_frame": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_frame": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "state": {
+          "$ref": "#/$defs/signal_state"
+        }
+      }
+    },
+    "transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "frame",
+        "from_state",
+        "to_state",
+        "ambiguous"
+      ],
+      "properties": {
+        "frame": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "from_state": {
+          "$ref": "#/$defs/signal_state"
+        },
+        "to_state": {
+          "$ref": "#/$defs/signal_state"
+        },
+        "ambiguous": {
+          "type": "boolean"
+        }
+      }
+    },
+    "motion_interval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start_frame",
+        "end_frame",
+        "state"
+      ],
+      "properties": {
+        "start_frame": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_frame": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "state": {
+          "enum": [
+            "APPROACHING",
+            "STOPPED",
+            "RECEDING",
+            "UNKNOWN"
+          ]
+        }
+      }
+    },
+    "screen_stage_interval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start_frame",
+        "end_frame",
+        "stage"
+      ],
+      "properties": {
+        "start_frame": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_frame": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "stage": {
+          "enum": [
+            "ORDER_TYPE_SELECTION",
+            "PAYMENT",
+            "CONFIRMATION",
+            "UNKNOWN"
+          ]
+        }
+      }
+    },
+    "text_annotation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start_frame",
+        "end_frame",
+        "text",
+        "ambiguous"
+      ],
+      "properties": {
+        "start_frame": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_frame": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ambiguous": {
+          "type": "boolean"
+        }
+      }
+    },
+    "object_annotation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ground_truth_id",
+        "object_type",
+        "visible_frame_ranges",
+        "signal_state_intervals",
+        "transitions",
+        "motion_intervals",
+        "route_number",
+        "screen_stage_intervals",
+        "text_annotations"
+      ],
+      "properties": {
+        "ground_truth_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "object_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "visible_frame_ranges": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/frame_range"
+          }
+        },
+        "signal_state_intervals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/signal_state_interval"
+          }
+        },
+        "transitions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/transition"
+          }
+        },
+        "motion_intervals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/motion_interval"
+          }
+        },
+        "route_number": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "screen_stage_intervals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/screen_stage_interval"
+          }
+        },
+        "text_annotations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/text_annotation"
+          }
+        }
+      }
+    },
+    "narration_constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "forbidden_phrases",
+        "forbidden_patterns",
+        "maximum_duplicate_events",
+        "notes"
+      ],
+      "properties": {
+        "forbidden_phrases": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "forbidden_patterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "maximum_duplicate_events": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "notes": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

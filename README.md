@@ -36,13 +36,22 @@
 
 ```text
 YOLO26 탐지 → ByteTrack/stable ID → ObjectRouter
-    ├─ traffic light       → TrafficLightAnalyzer
-    ├─ bus                 → BusAnalyzer
-    ├─ kiosk               → KioskAnalyzer
-    ├─ sign/display/screen → TextObjectAnalyzer
-    └─ 그 외               → GenericVisionAnalyzer
+    ├─ traffic_light/pedestrian_signal/vehicle_traffic_light → TrafficLightAnalyzer
+    ├─ bus                                                   → BusAnalyzer
+    ├─ kiosk/self_service_kiosk/touchscreen_kiosk            → KioskAnalyzer
+    ├─ sign/display/screen/ticket_machine/bus_route_display  → TextObjectAnalyzer
+    └─ reverse_vending_machine/unknown_panel/그 외           → GenericVisionAnalyzer
 → AnalysisResult → SceneEventManager → NarrationPolicy
 ```
+
+커스텀 detector가 출력할 클래스명과 Analyzer 계약은 다음과 같습니다.
+
+| detector 클래스 | Analyzer | 안전 경계 |
+|---|---|---|
+| `pedestrian_signal`, `vehicle_traffic_light` | `TrafficLightAnalyzer` | 색 상태는 HSV와 연속 프레임으로만 확정 |
+| `kiosk`, `self_service_kiosk`, `touchscreen_kiosk` | `KioskAnalyzer` | 주문 단계·버튼 OCR 허용 |
+| `ticket_machine`, `bus_route_display`, `sign`, `display`, `screen`, `monitor` | `TextObjectAnalyzer` | 문자만 확정하며 주문 단계나 버스 번호 연계를 추측하지 않음 |
+| `reverse_vending_machine`, `unknown_panel` | `GenericVisionAnalyzer` | 주문 키오스크 단계 분석 금지, VLM allowlist 별도 적용 |
 
 `TrafficLightAnalyzer`는 stable ID마다 연속 관측 이력을 따로 관리합니다. 파이프라인에서
 이미 계산한 HSV 결과를 재사용하므로 같은 crop을 중복 분류하지 않으며, 세 프레임이
@@ -50,6 +59,9 @@ YOLO26 탐지 → ByteTrack/stable ID → ObjectRouter
 연속 횟수도 초기화됩니다. 기존 `StableObjectEventEngine` 이벤트는 원래 시각 그대로 먼저
 변환되고, `SceneEventManager`가 Analyzer의 확정 상태 전환을 보완한 뒤 같은 전환은 한
 번만 남깁니다.
+`traffic_light`는 COCO 호환을 위해 subtype을 `UNKNOWN`으로 유지하고,
+`pedestrian_signal`과 `vehicle_traffic_light`는 detector 클래스 근거를 각각
+`PEDESTRIAN`, `VEHICLE`로 보존합니다.
 
 `BusAnalyzer`는 stable ID별 bbox 면적과 중심 이동을 파이프라인 기본 9프레임의 중앙값
 추세로 비교해 `APPROACHING`, `STOPPED`, `RECEDING`, `UNKNOWN`을 안정화합니다. 작은 bbox
@@ -69,6 +81,8 @@ YOLO26 탐지 → ByteTrack/stable ID → ObjectRouter
 `DESCRIPTION_CONFIRMED` 이벤트를 생성합니다. 신호등, 버스 번호, OCR 텍스트 같은 전용
 판단을 대신하지 않습니다. 모든 분석기는 근거가 부족하면 내용을 추측하지 않고 `UNKNOWN`
 또는 `is_uncertain=true`를 반환합니다.
+`reverse_vending_machine`은 Generic 경로지만 기본 VLM allowlist에는 없으므로 필요할 때
+`--vlm-classes reverse_vending_machine`을 명시해야 합니다.
 
 버스 모션·번호 OCR은 detector confidence가 기본 `0.30` 이상일 때 이력을 쌓고, 키오스크·
 문자·Generic 분석은 기본 `0.50` 이상을 요구합니다. 확정 결과 confidence는 detector와
@@ -154,6 +168,34 @@ python scripts/detect_video.py \
 외부 유료 API는 연결하지 않으며, 모델과 OCR 엔진은 해당 객체가 실제로 등장할 때까지
 지연 로드됩니다. chat/instruction 형식의 `image-text-to-text` pipeline을 지원하는 모델을
 사용해야 합니다.
+
+### 공개 테스트 팩 baseline
+
+공개 영상 팩은 `samples/public_test_pack/`에 풀어 두되 Git에는 추가하지 않습니다. manifest,
+annotation schema, 실제 COCO 라우팅 한계는
+[`datasets/public_baseline/README.md`](datasets/public_baseline/README.md)에 정리돼 있습니다.
+
+```bash
+python scripts/prepare_annotations.py \
+  --manifest datasets/public_baseline/manifest.json \
+  --output-dir datasets/public_baseline/review
+
+python scripts/run_public_baseline.py \
+  --manifest datasets/public_baseline/manifest.json \
+  --output-dir outputs/public_baseline \
+  --device cpu
+
+python scripts/evaluate_public_baseline.py \
+  --manifest datasets/public_baseline/manifest.json \
+  --predictions outputs/public_baseline \
+  --output-dir outputs/public_baseline/evaluation
+```
+
+배치 실행은 신호등에 COCO class `9`, 버스에 class `5`, 키오스크 유사 기계에는 전체 COCO
+클래스를 동일 baseline 설정으로 사용합니다. 영상별 오류는 격리되고 실행 설정·Git SHA·실제
+Analyzer 호출 수와 한계가 `run_summary.json`/`.csv`에 기록됩니다. 평가는 사람이
+`reviewed`로 표시한 annotation만 정량화하며, 미검수 영상은 운영 관측과 안전 constraint를 담은
+정성 report만 생성합니다. 산출 불가능한 지표는 `0` 대신 `null`과 사유로 남습니다.
 
 ## 2. 신호등 영상 실행
 
@@ -382,13 +424,15 @@ ruff check .
 - stable ID 재연결은 같은 클래스의 바운딩박스 IoU와 짧은 누락 구간을 사용합니다.
 - `visiontest3`처럼 `max_missed_frames`보다 긴 가림에서는 같은 물리 객체라도 새 stable ID가
   부여될 수 있습니다.
-- COCO 클래스만으로 보행자용/차량용 신호를 확정할 수 없어 `signal_type`은 현재
-  `UNKNOWN`입니다.
+- COCO `traffic light`만으로는 보행자용/차량용 신호를 확정할 수 없어 `signal_type`은
+  `UNKNOWN`입니다. 명시적인 커스텀 클래스 `pedestrian_signal`과
+  `vehicle_traffic_light`가 들어오면 subtype을 보존합니다.
 - 버스 접근 판정은 한 카메라의 bbox 크기·중심 변화 휴리스틱이므로 카메라 자체의 이동,
   가림, 급격한 시점 변화에 영향을 받습니다.
-- 기본 COCO 모델에는 `kiosk`, `sign`, `display`, `screen` 클래스가 없습니다. 해당 이름을
-  출력하는 커스텀 탐지 모델이 있어야 전용 라우팅이 가능하며, COCO의 `bus`, `stop sign`,
-  `tv`는 각각 버스 또는 문자 분석기로 라우팅됩니다.
+- 기본 COCO 모델에는 위 커스텀 클래스가 없습니다. 해당 이름을 출력하는 커스텀 checkpoint가
+  있어야 전용 라우팅이 실제 영상에서 가능하며, 현재 구현은 런타임 클래스 계약만 제공합니다.
+  학습 데이터나 새 detector 가중치를 임의로 생성하지 않았습니다. COCO의 `bus`, `stop sign`,
+  `tv`는 기존대로 버스 또는 문자 분석기로 라우팅됩니다.
 - OCR 품질은 crop 해상도와 선택한 언어 모델에 의존합니다. 버스는 `visiontest.mp4` 한 편에서
   실제 검증했지만 다양한 노선 표시·야간·가림 조건에 일반화됐다고 볼 수 없습니다. 키오스크는
   실제 촬영 영상이 없어 합성 crop과 주입형 OCR 결과 중심으로 검증했습니다.

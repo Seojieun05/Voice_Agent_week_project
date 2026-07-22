@@ -12,6 +12,7 @@ from .event_manager import (
     SCREEN_CHANGED,
     TEXT_CONFIRMED,
 )
+from .object_types import KIOSK_OBJECT_TYPES, SIGNAL_OBJECT_TYPES
 from .types import AnalysisEvent
 
 _UNKNOWN_STATES = {"", "UNKNOWN", "UNCERTAIN", "NONE"}
@@ -22,15 +23,22 @@ _STATE_LABELS = {
 }
 _OBJECT_LABELS = {
     "pedestrian_signal": "보행자 신호",
+    "vehicle_traffic_light": "차량 신호",
     "traffic_light": "신호등",
     "bus": "버스",
     "kiosk": "키오스크",
+    "self_service_kiosk": "무인 키오스크",
+    "touchscreen_kiosk": "터치스크린 키오스크",
     "sign": "표지판",
     "stop_sign": "표지판",
     "display": "전광판",
     "screen": "화면",
     "monitor": "화면",
     "tv": "화면",
+    "ticket_machine": "발권기",
+    "reverse_vending_machine": "빈 용기 회수기",
+    "bus_route_display": "버스 노선 표시기",
+    "unknown_panel": "알 수 없는 조작 패널",
     "person": "사람",
     "car": "자동차",
     "vehicle": "차량",
@@ -106,10 +114,7 @@ class NarrationPolicy:
     @staticmethod
     def priority_for(event: AnalysisEvent) -> int:
         object_type = event.object_type.strip().lower().replace(" ", "_")
-        if event.event_type == OBJECT_STATE_CHANGED and object_type in {
-            "pedestrian_signal",
-            "traffic_light",
-        }:
+        if event.event_type == OBJECT_STATE_CHANGED and object_type in SIGNAL_OBJECT_TYPES:
             return 1
         if event.event_type == OBJECT_APPROACHING and object_type in {
             "bus",
@@ -119,7 +124,7 @@ class NarrationPolicy:
             return 2
         if event.event_type == TEXT_CONFIRMED and object_type == "bus":
             return 3
-        if event.event_type == SCREEN_CHANGED and object_type == "kiosk":
+        if event.event_type == SCREEN_CHANGED and object_type in KIOSK_OBJECT_TYPES:
             return 4
         if event.event_type == TEXT_CONFIRMED:
             return 5
@@ -149,6 +154,8 @@ class NarrationPolicy:
                 return None
             if object_type == "pedestrian_signal":
                 return f"보행자 신호가 {state_label}으로 바뀌었습니다."
+            if object_type == "vehicle_traffic_light":
+                return f"차량 신호가 {state_label}으로 바뀌었습니다."
             if object_type == "traffic_light":
                 return f"신호등 표시가 {state_label}으로 바뀌었습니다."
             return f"{_object_label(object_type)} 상태가 {state_label}으로 바뀌었습니다."
@@ -173,14 +180,15 @@ class NarrationPolicy:
             return f"{_object_label(object_type)}에 {text}라고 표시되어 있습니다."
 
         if event.event_type == SCREEN_CHANGED:
-            if object_type != "kiosk":
+            if object_type not in KIOSK_OBJECT_TYPES:
                 return None
+            object_label = _object_label(object_type)
             options = _visible_options(event)
             if len(options) == 2:
                 return f"{options[0]}와 {options[1]} 중 하나를 선택하는 화면입니다."
             if options:
-                return f"키오스크 화면에 {', '.join(options)} 선택지가 있습니다."
-            return "키오스크 화면이 바뀌었습니다."
+                return f"{object_label} 화면에 {', '.join(options)} 선택지가 있습니다."
+            return f"{object_label} 화면이 바뀌었습니다."
 
         if event.event_type == DESCRIPTION_CONFIRMED:
             description = _string_attribute(event, "description")

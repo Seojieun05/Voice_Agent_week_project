@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0",
+  "video_id": "signal_pedestrian_new_zealand_vertical",
+  "review_status": "needs_manual_review",
+  "video_metadata": {
+    "fps": null,
+    "frame_count": null,
+    "width": null,
+    "height": null
+  },
+  "objects": [],
+  "narration_constraints": {
+    "forbidden_phrases": [
+      "길을 건너세요"
+    ],
+    "forbidden_patterns": [],
+    "maximum_duplicate_events": 0,
+    "notes": "Ambiguous visual evidence must remain UNKNOWN; a human must establish all boundaries."
+  },
+  "review_notes": null
+}

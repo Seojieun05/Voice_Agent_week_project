@@ -8,20 +8,14 @@ from .analyzers import (
     TextObjectAnalyzer,
     TrafficLightAnalyzer,
 )
-from .analyzers.base import normalize_object_type, resolve_stable_id
+from .analyzers.base import resolve_stable_id
+from .object_types import AnalyzerKind, object_class_spec
 from .signals import ImageArray, SignalStateResult
 from .types import AnalysisResult, Detection
 
 
 class ObjectRouter:
     """Route each tracked detection to one object-specific analyzer."""
-
-    _TEXT_OBJECT_TYPES = frozenset(
-        {"sign", "stop_sign", "display", "screen", "monitor", "tv"}
-    )
-    _KIOSK_OBJECT_TYPES = frozenset(
-        {"kiosk", "self_service_kiosk", "touchscreen_kiosk"}
-    )
 
     def __init__(
         self,
@@ -47,14 +41,14 @@ class ObjectRouter:
         )
 
     def analyzer_for(self, class_name: str) -> ObjectAnalyzer:
-        object_type = normalize_object_type(class_name)
-        if object_type == "traffic_light":
+        analyzer_kind = object_class_spec(class_name).analyzer
+        if analyzer_kind is AnalyzerKind.TRAFFIC_LIGHT:
             return self.traffic_light_analyzer
-        if object_type == "bus":
+        if analyzer_kind is AnalyzerKind.BUS:
             return self.bus_analyzer
-        if object_type in self._KIOSK_OBJECT_TYPES:
+        if analyzer_kind is AnalyzerKind.KIOSK:
             return self.kiosk_analyzer
-        if object_type in self._TEXT_OBJECT_TYPES:
+        if analyzer_kind is AnalyzerKind.TEXT:
             return self.text_object_analyzer
         return self.generic_vision_analyzer
 

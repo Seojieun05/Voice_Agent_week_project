@@ -570,11 +570,16 @@ def run_video_pipeline(
 
                 result = results[0]
                 detections = _build_detection_list(result, frame_index, timestamp_s)
+                signal_detection_indices = {
+                    index
+                    for index, detection in enumerate(detections)
+                    if signal_target_selector.is_signal_detection(detection)
+                }
                 selected_signal_indices = set(signal_target_selector.select_indices(detections))
                 event_indices = [
                     index
-                    for index, detection in enumerate(detections)
-                    if detection.class_id != 9 or index in selected_signal_indices
+                    for index in range(len(detections))
+                    if index not in signal_detection_indices or index in selected_signal_indices
                 ]
                 event_detections = [detections[index] for index in event_indices]
                 signal_results_by_index: dict[int, SignalStateResult] = {}
@@ -686,7 +691,7 @@ def run_video_pipeline(
                                 stable_object_key=stable_keys_by_index.get(index),
                                 is_signal_target=(
                                     index in selected_signal_indices
-                                    if detection.class_id == 9
+                                    if index in signal_detection_indices
                                     else None
                                 ),
                                 signal_result=signal_results_by_index.get(index),
@@ -712,8 +717,8 @@ def run_video_pipeline(
                 plotted = frame.copy()
                 visible_indices = [
                     index
-                    for index, detection in enumerate(detections)
-                    if detection.class_id != 9 or index in selected_signal_indices
+                    for index in range(len(detections))
+                    if index not in signal_detection_indices or index in selected_signal_indices
                 ]
                 for detection_index in visible_indices:
                     _draw_detection(

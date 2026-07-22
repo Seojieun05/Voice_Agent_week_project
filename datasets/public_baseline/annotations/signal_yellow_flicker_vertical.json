@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.0",
+  "video_id": "signal_yellow_flicker_vertical",
+  "review_status": "needs_manual_review",
+  "video_metadata": {
+    "fps": null,
+    "frame_count": null,
+    "width": null,
+    "height": null
+  },
+  "objects": [],
+  "narration_constraints": {
+    "forbidden_phrases": [
+      "길을 건너세요"
+    ],
+    "forbidden_patterns": [
+      "빨간색으로 바뀌었습니다",
+      "초록색으로 바뀌었습니다"
+    ],
+    "maximum_duplicate_events": 0,
+    "notes": "The supplied safety constraint forbids confident RED/GREEN transition narration for yellow flicker."
+  },
+  "review_notes": null
+}

@@ -6,6 +6,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
+from ..object_types import is_kiosk_object_type, normalize_object_type
 from ..ocr import OcrEngine, OcrResult
 from ..signals import ImageArray, SignalStateResult
 from ..types import AnalysisResult, Detection
@@ -247,7 +248,9 @@ class KioskAnalyzer:
             if (
                 isinstance(raw_bbox, (tuple, list))
                 and len(raw_bbox) == 4
-                and all(isinstance(value, int) and not isinstance(value, bool) for value in raw_bbox)
+                and all(
+                    isinstance(value, int) and not isinstance(value, bool) for value in raw_bbox
+                )
                 and 1 <= len(deduplication_key) <= 30
             ):
                 left, top, right, bottom = raw_bbox
@@ -413,8 +416,11 @@ class KioskAnalyzer:
         elif is_uncertain:
             attributes["reason"] = "stage_confirmation_pending"
 
+        detected_object_type = normalize_object_type(detection.class_name)
         return AnalysisResult(
-            object_type="kiosk",
+            object_type=(
+                detected_object_type if is_kiosk_object_type(detected_object_type) else "kiosk"
+            ),
             stable_id=stable_id,
             state=stage,
             confidence=combined_confidence if not is_uncertain else 0.0,

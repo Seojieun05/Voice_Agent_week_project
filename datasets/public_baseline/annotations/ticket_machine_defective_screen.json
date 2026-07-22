@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.0",
+  "video_id": "ticket_machine_defective_screen",
+  "review_status": "needs_manual_review",
+  "video_metadata": {
+    "fps": null,
+    "frame_count": null,
+    "width": null,
+    "height": null
+  },
+  "objects": [],
+  "narration_constraints": {
+    "forbidden_phrases": [
+      "키오스크 화면이 바뀌었습니다"
+    ],
+    "forbidden_patterns": [
+      "결제.*화면",
+      "확인.*화면"
+    ],
+    "maximum_duplicate_events": 0,
+    "notes": "A defective screen must not be narrated as PAYMENT or CONFIRMATION."
+  },
+  "review_notes": null
+}

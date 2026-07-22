@@ -1,0 +1,35 @@
+{
+  "video_id": "replace_with_source_id",
+  "review_status": "needs_manual_review",
+  "video_metadata": {
+    "fps": null,
+    "frame_count": null,
+    "width": null,
+    "height": null
+  },
+  "objects": [
+    {
+      "ground_truth_id": "object-1",
+      "object_type": "traffic_light | pedestrian_signal | vehicle_signal | bus | kiosk | screen | unknown_machine",
+      "visible_frame_ranges": [[0, 0]],
+      "state_intervals": [
+        {"start_frame": 0, "end_frame": 0, "state": "RED | GREEN | YELLOW | OFF | UNKNOWN"}
+      ],
+      "transitions": [
+        {"frame": 0, "from": "RED", "to": "GREEN", "certainty": "clear | ambiguous"}
+      ],
+      "route_number": null,
+      "motion_intervals": [
+        {"start_frame": 0, "end_frame": 0, "state": "APPROACHING | STOPPED | RECEDING | UNKNOWN"}
+      ],
+      "screen_stage_intervals": [
+        {"start_frame": 0, "end_frame": 0, "stage": "ORDER_TYPE_SELECTION | PAYMENT | CONFIRMATION | UNKNOWN"}
+      ]
+    }
+  ],
+  "expected_narration_constraints": {
+    "forbidden_phrases": [],
+    "maximum_duplicate_events": 0,
+    "notes": "Never invent unreadable text, route numbers, signal subtype, or safe-crossing instructions."
+  }
+}
