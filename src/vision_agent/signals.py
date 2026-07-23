@@ -249,6 +249,10 @@ class SignalTargetSelector:
         self.config = config or SignalTargetSelectorConfig()
         self._selected_track_ids: set[int] = set()
 
+    def reset(self) -> None:
+        """Forget raw-track preferences from the previous stream or session."""
+        self._selected_track_ids.clear()
+
     def _preferred(self, detection: Detection) -> bool:
         return _is_preferred_signal_box(detection.xyxy, self.config)
 

@@ -21,6 +21,7 @@ class _TextHistory:
     candidate_confidence_sum: float = 0.0
     candidate_best_confidence: float = 0.0
     last_frame_index: int | None = None
+    last_ocr_frame: int | None = None
 
 
 def _text_fingerprint(text: str) -> str:
@@ -57,6 +58,7 @@ class TextObjectAnalyzer:
         minimum_text_width: int = 8,
         minimum_text_height: int = 8,
         minimum_text_pixels: int = 64,
+        ocr_interval_frames: int = 1,
     ) -> None:
         if (
             not isinstance(minimum_confirmed_frames, int)
@@ -64,6 +66,12 @@ class TextObjectAnalyzer:
             or minimum_confirmed_frames < 1
         ):
             raise ValueError("minimum_confirmed_frames must be a positive integer")
+        if (
+            not isinstance(ocr_interval_frames, int)
+            or isinstance(ocr_interval_frames, bool)
+            or ocr_interval_frames < 1
+        ):
+            raise ValueError("ocr_interval_frames must be a positive integer")
         for name, value in (
             ("minimum_detection_confidence", minimum_detection_confidence),
             ("minimum_ocr_confidence", minimum_ocr_confidence),
@@ -93,6 +101,7 @@ class TextObjectAnalyzer:
         self.minimum_text_width = minimum_text_width
         self.minimum_text_height = minimum_text_height
         self.minimum_text_pixels = minimum_text_pixels
+        self.ocr_interval_frames = ocr_interval_frames
         self._history_by_stable_id: dict[str, _TextHistory] = {}
 
     def _text_region_is_large_enough(
@@ -127,8 +136,15 @@ class TextObjectAnalyzer:
         )
         if not is_consecutive:
             self._clear_candidate(history)
+            history.last_ocr_frame = None
         history.last_frame_index = frame_index
         return is_consecutive
+
+    def _ocr_is_due(self, history: _TextHistory, frame_index: int) -> bool:
+        return (
+            history.last_ocr_frame is None
+            or frame_index - history.last_ocr_frame >= self.ocr_interval_frames
+        )
 
     def _uncertain_result(
         self,
@@ -141,6 +157,7 @@ class TextObjectAnalyzer:
         observed_text: str | None = None,
         ocr_confidence: float = 0.0,
         ocr_result: OcrResult | None = None,
+        ocr_was_run: bool = False,
     ) -> AnalysisResult:
         return AnalysisResult(
             object_type=normalize_object_type(detection.class_name),
@@ -154,6 +171,8 @@ class TextObjectAnalyzer:
                 "observed_text": observed_text,
                 "ocr_confidence": ocr_confidence,
                 "confirmed_text_confidence": history.confirmed_confidence,
+                "ocr_was_run": ocr_was_run or ocr_result is not None,
+                "ocr_interval_frames": self.ocr_interval_frames,
                 "ocr_confirmed_frames": 0,
                 "ocr_candidate_frames": history.candidate_frames,
                 "observations_are_consecutive": observations_are_consecutive,
@@ -237,6 +256,7 @@ class TextObjectAnalyzer:
             or detection_confidence < self.minimum_detection_confidence
         ):
             self._clear_candidate(history)
+            history.last_ocr_frame = None
             return self._uncertain_result(
                 detection,
                 stable_id,
@@ -247,6 +267,7 @@ class TextObjectAnalyzer:
 
         if crop is None or crop.ndim not in {2, 3} or crop.size == 0:
             self._clear_candidate(history)
+            history.last_ocr_frame = None
             return self._uncertain_result(
                 detection,
                 stable_id,
@@ -262,6 +283,7 @@ class TextObjectAnalyzer:
             or crop_width * crop_height < self.minimum_crop_pixels
         ):
             self._clear_candidate(history)
+            history.last_ocr_frame = None
             return self._uncertain_result(
                 detection,
                 stable_id,
@@ -270,6 +292,16 @@ class TextObjectAnalyzer:
                 observations_are_consecutive=observations_are_consecutive,
             )
 
+        if not self._ocr_is_due(history, detection.frame_index):
+            return self._uncertain_result(
+                detection,
+                stable_id,
+                history,
+                reason="ocr_deferred",
+                observations_are_consecutive=observations_are_consecutive,
+            )
+
+        history.last_ocr_frame = detection.frame_index
         try:
             ocr_result = self.ocr_engine.recognize(crop)
         except Exception as exc:
@@ -377,6 +409,8 @@ class TextObjectAnalyzer:
                 "observed_text": observed_text,
                 "ocr_confidence": ocr_confidence,
                 "confirmed_text_confidence": history.confirmed_confidence,
+                "ocr_was_run": True,
+                "ocr_interval_frames": self.ocr_interval_frames,
                 "ocr_confirmed_frames": history.candidate_frames,
                 "ocr_candidate_frames": history.candidate_frames,
                 "observations_are_consecutive": observations_are_consecutive,

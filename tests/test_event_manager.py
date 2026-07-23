@@ -61,6 +61,27 @@ def test_standalone_first_result_appears_and_missing_result_disappears() -> None
     assert [event.event_type for event in disappeared] == [OBJECT_DISAPPEARED]
 
 
+def test_general_presence_events_remain_available_when_default_policy_mutes_them() -> None:
+    manager = SceneEventManager()
+    policy = NarrationPolicy()
+    person = AnalysisResult(
+        object_type="person",
+        stable_id="stable-2",
+        state=None,
+        confidence=0.9,
+        attributes={"detection_confidence": 0.9},
+        is_uncertain=False,
+    )
+
+    appeared = manager.update([person], 0.0)
+    disappeared = manager.update([], 0.1)
+
+    assert [event.event_type for event in appeared] == [OBJECT_APPEARED]
+    assert [event.event_type for event in disappeared] == [OBJECT_DISAPPEARED]
+    assert policy.narrate(appeared) == []
+    assert policy.narrate(disappeared) == []
+
+
 def test_known_state_change_emits_once_and_same_state_is_suppressed() -> None:
     manager = SceneEventManager(auto_presence=False)
     assert manager.update([result("GREEN")], 0.0) == []
@@ -182,7 +203,9 @@ def test_stabilized_legacy_presence_does_not_inherit_analysis_uncertainty() -> N
 
 def test_low_detector_legacy_presence_waits_until_same_object_is_confident() -> None:
     manager = SceneEventManager(auto_presence=False, derive_state_changes=False)
-    policy = NarrationPolicy()
+    policy = NarrationPolicy(
+        presence_narration_object_types=("kiosk",),
+    )
 
     def kiosk(detection_confidence: float) -> AnalysisResult:
         return AnalysisResult(
@@ -219,16 +242,22 @@ def test_pending_low_confidence_presence_disappears_without_events() -> None:
         is_uncertain=True,
     )
 
-    assert manager.update(
-        [low_confidence],
-        1.0,
-        scene_events=[legacy_event("appeared", 1.0)],
-    ) == []
-    assert manager.update(
-        [],
-        2.0,
-        scene_events=[legacy_event("disappeared", 2.0)],
-    ) == []
+    assert (
+        manager.update(
+            [low_confidence],
+            1.0,
+            scene_events=[legacy_event("appeared", 1.0)],
+        )
+        == []
+    )
+    assert (
+        manager.update(
+            [],
+            2.0,
+            scene_events=[legacy_event("disappeared", 2.0)],
+        )
+        == []
+    )
 
 
 def test_unknown_legacy_transition_is_ignored() -> None:
@@ -432,9 +461,9 @@ def test_low_confidence_opposite_motion_does_not_restart_approach_episode() -> N
             is_uncertain=False,
         )
 
-    assert [
-        event.event_type for event in manager.update([bus("APPROACHING", 0.9)], 1.0)
-    ] == [OBJECT_APPROACHING]
+    assert [event.event_type for event in manager.update([bus("APPROACHING", 0.9)], 1.0)] == [
+        OBJECT_APPROACHING
+    ]
     assert manager.update([bus("RECEDING", 0.4)], 1.1) == []
     assert manager.update([bus("APPROACHING", 0.9)], 1.2) == []
 
@@ -551,9 +580,7 @@ def test_custom_threshold_retries_confirmed_kiosk_screen_without_change_pulse() 
     confirmed = manager.update([kiosk(0.9, changed=False)], 1.1)
 
     assert [event.event_type for event in confirmed] == [SCREEN_CHANGED]
-    assert policy.narrate(confirmed) == [
-        "매장 식사와 포장 중 하나를 선택하는 화면입니다."
-    ]
+    assert policy.narrate(confirmed) == ["매장 식사와 포장 중 하나를 선택하는 화면입니다."]
 
 
 def test_custom_threshold_retries_same_description_after_confidence_improves() -> None:
@@ -581,7 +608,7 @@ def test_custom_threshold_retries_same_description_after_confidence_improves() -
     assert policy.narrate(confirmed) == ["빨간 자판기가 보입니다."]
 
 
-def test_custom_threshold_does_not_consume_low_confidence_state_transition() -> None:
+def test_custom_narration_threshold_records_low_confidence_signal_without_speaking() -> None:
     policy = NarrationPolicy(minimum_confidence=0.8)
     manager = SceneEventManager(
         auto_presence=False,
@@ -589,13 +616,14 @@ def test_custom_threshold_does_not_consume_low_confidence_state_transition() -> 
     )
 
     assert manager.update([result("GREEN", confidence=0.9)], 1.0) == []
-    assert manager.update([result("RED", confidence=0.6)], 1.1) == []
-    confirmed = manager.update([result("RED", confidence=0.9)], 1.2)
+    recorded = manager.update([result("RED", confidence=0.6)], 1.1)
 
-    assert [event.event_type for event in confirmed] == [OBJECT_STATE_CHANGED]
-    assert confirmed[0].previous_state == "GREEN"
-    assert confirmed[0].current_state == "RED"
-    assert policy.narrate(confirmed) == ["보행자 신호가 빨간색으로 바뀌었습니다."]
+    assert [event.event_type for event in recorded] == [OBJECT_STATE_CHANGED]
+    assert recorded[0].previous_state == "GREEN"
+    assert recorded[0].current_state == "RED"
+    assert recorded[0].confidence == 0.6
+    assert policy.narrate(recorded) == []
+    assert manager.update([result("RED", confidence=0.9)], 1.2) == []
 
 
 def test_explicit_reset_releases_domain_deduplication_for_retired_id() -> None:
@@ -634,10 +662,6 @@ def test_confirmed_generic_description_emits_only_when_text_changes() -> None:
         is_uncertain=False,
     )
 
-    assert [event.event_type for event in manager.update([first], 1.0)] == [
-        DESCRIPTION_CONFIRMED
-    ]
+    assert [event.event_type for event in manager.update([first], 1.0)] == [DESCRIPTION_CONFIRMED]
     assert manager.update([first], 1.1) == []
-    assert [event.event_type for event in manager.update([changed], 2.0)] == [
-        DESCRIPTION_CONFIRMED
-    ]
+    assert [event.event_type for event in manager.update([changed], 2.0)] == [DESCRIPTION_CONFIRMED]

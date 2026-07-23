@@ -211,6 +211,56 @@ def test_missing_frame_breaks_stage_and_fingerprint_candidates() -> None:
     assert outputs[-1].attributes["screen_initial_confirmation"] is True
 
 
+def test_ocr_interval_skips_calls_without_adding_confirmation_votes() -> None:
+    order = _result("매장 식사", "포장")
+    engine = _QueueOcrEngine(order, order, order)
+    analyzer = KioskAnalyzer(
+        engine,
+        minimum_confirmed_frames=3,
+        minimum_screen_change_frames=3,
+        ocr_interval_frames=2,
+    )
+
+    outputs = [_analyze(analyzer, frame) for frame in range(5)]
+
+    assert engine.calls == 3
+    assert [result.attributes["ocr_was_run"] for result in outputs] == [
+        True,
+        False,
+        True,
+        False,
+        True,
+    ]
+    assert [result.attributes["screen_candidate_frames"] for result in outputs] == [
+        1,
+        1,
+        2,
+        2,
+        3,
+    ]
+    assert [result.state for result in outputs[:-1]] == [UNKNOWN] * 4
+    assert outputs[-1].state == ORDER_TYPE_SELECTION
+
+
+def test_processed_frame_gap_resets_throttled_kiosk_votes_and_runs_ocr_immediately() -> None:
+    order = _result("매장 식사", "포장")
+    engine = _QueueOcrEngine(order, order, order)
+    analyzer = KioskAnalyzer(
+        engine,
+        minimum_confirmed_frames=2,
+        minimum_screen_change_frames=2,
+        ocr_interval_frames=3,
+    )
+
+    outputs = [_analyze(analyzer, frame) for frame in (0, 1, 3, 4, 5, 6)]
+
+    assert engine.calls == 3
+    assert outputs[2].attributes["ocr_was_run"] is True
+    assert outputs[2].attributes["screen_candidate_frames"] == 1
+    assert outputs[2].state == UNKNOWN
+    assert outputs[-1].state == ORDER_TYPE_SELECTION
+
+
 def test_confirmed_screen_change_is_reported_once() -> None:
     first_screen = _result("매장 식사", "포장", "메뉴 선택")
     next_screen = _result("결제 방법", "카드", "현금")
@@ -379,6 +429,8 @@ def test_unavailable_ocr_result_is_not_treated_as_text() -> None:
         ({"minimum_confirmed_frames": 0}, "minimum_confirmed_frames"),
         ({"minimum_confirmed_frames": True}, "minimum_confirmed_frames"),
         ({"minimum_screen_change_frames": 0}, "minimum_screen_change_frames"),
+        ({"ocr_interval_frames": 0}, "ocr_interval_frames"),
+        ({"ocr_interval_frames": True}, "ocr_interval_frames"),
     ],
 )
 def test_invalid_configuration_is_rejected(

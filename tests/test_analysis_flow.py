@@ -165,3 +165,48 @@ def test_low_detector_signal_cannot_narrate_until_a_new_reliable_transition() ->
         messages.extend(policy.narrate(manager.update([result], frame_index / 30.0)))
 
     assert messages == ["신호등 표시가 초록색으로 바뀌었습니다."]
+
+
+def test_low_detector_confidence_caps_recorded_signal_event_and_blocks_narration() -> None:
+    analyzer = TrafficLightAnalyzer(
+        minimum_confirmed_frames=3,
+        minimum_detection_confidence=0.2,
+    )
+    manager = SceneEventManager(auto_presence=False)
+    policy = NarrationPolicy()
+    events = []
+    final_result = None
+
+    states = [SignalState.GREEN] * 3 + [SignalState.RED] * 3
+    for frame_index, state in enumerate(states):
+        result = analyzer.analyze(
+            detection(
+                frame_index,
+                "traffic light",
+                9,
+                confidence=0.21,
+            ),
+            stable_id="stable-4",
+            precomputed_signal_result=SignalStateResult(
+                state=state,
+                confidence=1.0,
+                red_ratio=0.02 if state is SignalState.RED else 0.0,
+                green_ratio=0.02 if state is SignalState.GREEN else 0.0,
+            ),
+        )
+        events.extend(manager.update([result], frame_index / 30.0))
+        final_result = result
+
+    assert final_result is not None
+    assert final_result.attributes["detection_confidence"] == 0.21
+    assert final_result.attributes["signal_evidence_confidence"] == 1.0
+    assert final_result.confidence == 0.21
+    assert len(events) == 1
+    changed = events[0]
+    assert changed.event_type == "OBJECT_STATE_CHANGED"
+    assert changed.previous_state == "GREEN"
+    assert changed.current_state == "RED"
+    assert changed.confidence == 0.21
+    assert changed.confidence <= changed.attributes["detection_confidence"]
+    assert changed.confidence <= changed.attributes["signal_evidence_confidence"]
+    assert policy.narrate(changed) == []

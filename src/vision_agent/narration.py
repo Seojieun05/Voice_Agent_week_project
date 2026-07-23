@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+import heapq
+import math
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 
 from .event_manager import (
     DESCRIPTION_CONFIRMED,
@@ -54,6 +56,19 @@ class Narration:
     event: AnalysisEvent
 
 
+@dataclass(order=True, slots=True)
+class _ScheduledNarration:
+    priority: int
+    sequence: int
+    expires_at_s: float = field(compare=False)
+    deduplication_key: tuple[object, ...] = field(compare=False)
+    narration: Narration = field(compare=False)
+
+
+def _normalized_object_type(value: str) -> str:
+    return "_".join(value.strip().lower().replace("-", " ").split())
+
+
 def _normalized_state(value: object) -> str | None:
     if value is None:
         return None
@@ -63,8 +78,7 @@ def _normalized_state(value: object) -> str | None:
 
 
 def _object_label(object_type: str) -> str:
-    normalized = object_type.strip().lower().replace("-", "_").replace(" ", "_")
-    return _OBJECT_LABELS.get(normalized, f"{normalized} 객체")
+    return _OBJECT_LABELS.get(object_type, f"{object_type} 객체")
 
 
 def _with_subject_particle(label: str) -> str:
@@ -98,6 +112,8 @@ class NarrationPolicy:
         minimum_confidence: float = 0.5,
         duplicate_cooldown_s: float = 5.0,
         max_messages_per_batch: int = 1,
+        presence_narration_object_types: Sequence[str] = (),
+        allow_bus_approach: bool = True,
     ) -> None:
         if not 0.0 <= minimum_confidence <= 1.0:
             raise ValueError("minimum_confidence must be between 0 and 1")
@@ -105,15 +121,26 @@ class NarrationPolicy:
             raise ValueError("duplicate_cooldown_s must be non-negative")
         if max_messages_per_batch < 1:
             raise ValueError("max_messages_per_batch must be at least 1")
+        if isinstance(presence_narration_object_types, (str, bytes)):
+            raise ValueError("presence_narration_object_types must be a sequence of names")
+        normalized_presence_types: set[str] = set()
+        for value in presence_narration_object_types:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("presence_narration_object_types must contain non-empty strings")
+            normalized_presence_types.add(_normalized_object_type(value))
+        if not isinstance(allow_bus_approach, bool):
+            raise ValueError("allow_bus_approach must be a boolean")
 
         self.minimum_confidence = minimum_confidence
         self.duplicate_cooldown_s = duplicate_cooldown_s
         self.max_messages_per_batch = max_messages_per_batch
+        self.presence_narration_object_types = frozenset(normalized_presence_types)
+        self.allow_bus_approach = allow_bus_approach
         self._last_narrated_at: dict[tuple[object, ...], float] = {}
 
     @staticmethod
     def priority_for(event: AnalysisEvent) -> int:
-        object_type = event.object_type.strip().lower().replace(" ", "_")
+        object_type = _normalized_object_type(event.object_type)
         if event.event_type == OBJECT_STATE_CHANGED and object_type in SIGNAL_OBJECT_TYPES:
             return 1
         if event.event_type == OBJECT_APPROACHING and object_type in {
@@ -143,7 +170,7 @@ class NarrationPolicy:
         if event.confidence < self.minimum_confidence:
             return None
 
-        object_type = event.object_type.strip().lower().replace(" ", "_")
+        object_type = _normalized_object_type(event.object_type)
         if event.event_type == OBJECT_STATE_CHANGED:
             previous_state = _normalized_state(event.previous_state)
             current_state = _normalized_state(event.current_state)
@@ -162,6 +189,8 @@ class NarrationPolicy:
 
         if event.event_type == OBJECT_APPROACHING:
             if object_type == "bus":
+                if not self.allow_bus_approach:
+                    return None
                 route_number = _string_attribute(event, "route_number")
                 if route_number is not None:
                     return f"{route_number}번 버스가 들어오고 있습니다."
@@ -194,6 +223,11 @@ class NarrationPolicy:
             description = _string_attribute(event, "description")
             return description
 
+        if (
+            event.event_type in {OBJECT_APPEARED, OBJECT_DISAPPEARED}
+            and object_type not in self.presence_narration_object_types
+        ):
+            return None
         if event.event_type == OBJECT_APPEARED:
             return f"{_with_subject_particle(_object_label(object_type))} 감지되었습니다."
         if event.event_type == OBJECT_DISAPPEARED:
@@ -201,7 +235,7 @@ class NarrationPolicy:
         return None
 
     @staticmethod
-    def _deduplication_key(event: AnalysisEvent, message: str) -> tuple[object, ...]:
+    def deduplication_key(event: AnalysisEvent, message: str) -> tuple[object, ...]:
         semantic_identity = (
             event.attributes.get("screen_fingerprint")
             if event.event_type == SCREEN_CHANGED
@@ -209,13 +243,28 @@ class NarrationPolicy:
         )
         return (
             event.event_type,
-            event.object_type,
+            _normalized_object_type(event.object_type),
             event.stable_id,
             _normalized_state(event.previous_state),
             _normalized_state(event.current_state),
             semantic_identity,
             message,
         )
+
+    @staticmethod
+    def _deduplication_key(event: AnalysisEvent, message: str) -> tuple[object, ...]:
+        """Backward-compatible alias for the scheduler's public semantic key."""
+        return NarrationPolicy.deduplication_key(event, message)
+
+    def candidate_for(self, event: AnalysisEvent) -> Narration | None:
+        """Convert one event to a pure prioritized candidate, without history writes."""
+        message = self.message_for(event)
+        if message is None:
+            return None
+        priority = self.priority_for(event)
+        if priority >= 100:
+            return None
+        return Narration(message, priority, event)
 
     def _is_recent_duplicate(self, event: AnalysisEvent, message: str) -> bool:
         key = self._deduplication_key(event, message)
@@ -228,13 +277,10 @@ class NarrationPolicy:
         """Select at most the configured number of highest-priority messages."""
         candidates: list[tuple[int, int, Narration]] = []
         for index, event in enumerate(events):
-            message = self.message_for(event)
-            if message is None or self._is_recent_duplicate(event, message):
+            narration = self.candidate_for(event)
+            if narration is None or self._is_recent_duplicate(event, narration.message):
                 continue
-            priority = self.priority_for(event)
-            if priority >= 100:
-                continue
-            candidates.append((priority, index, Narration(message, priority, event)))
+            candidates.append((narration.priority, index, narration))
 
         candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
         selected = [candidate[2] for candidate in candidates[: self.max_messages_per_batch]]
@@ -243,7 +289,164 @@ class NarrationPolicy:
             self._last_narrated_at[key] = narration.event.timestamp_s
         return selected
 
+    def reset(self) -> None:
+        """Clear direct-policy duplicate history at a session boundary."""
+        self._last_narrated_at.clear()
+
     def narrate(self, events: AnalysisEvent | Sequence[AnalysisEvent]) -> list[str]:
         """Return deterministic messages for one event or one simultaneous batch."""
         batch = [events] if isinstance(events, AnalysisEvent) else events
         return [narration.message for narration in self.select(batch)]
+
+
+class NarrationScheduler:
+    """Retain prioritized narration candidates until emitted or expired."""
+
+    def __init__(
+        self,
+        policy: NarrationPolicy | None = None,
+        *,
+        max_queue_size: int = 32,
+        default_ttl_s: float = 5.0,
+        ttl_by_event_type: Mapping[str, float] | None = None,
+        duplicate_cooldown_s: float | None = None,
+    ) -> None:
+        if (
+            not isinstance(max_queue_size, int)
+            or isinstance(max_queue_size, bool)
+            or max_queue_size < 1
+        ):
+            raise ValueError("max_queue_size must be a positive integer")
+        self._validate_duration("default_ttl_s", default_ttl_s, positive=True)
+
+        normalized_ttls: dict[str, float] = {}
+        for event_type, ttl_s in (ttl_by_event_type or {}).items():
+            if not isinstance(event_type, str) or not event_type.strip():
+                raise ValueError("ttl_by_event_type keys must be non-empty strings")
+            self._validate_duration("ttl_by_event_type values", ttl_s)
+            normalized_ttls[event_type.strip().upper()] = float(ttl_s)
+
+        self.policy = policy or NarrationPolicy()
+        cooldown_s = (
+            self.policy.duplicate_cooldown_s
+            if duplicate_cooldown_s is None
+            else duplicate_cooldown_s
+        )
+        self._validate_duration("duplicate_cooldown_s", cooldown_s)
+        self.max_queue_size = max_queue_size
+        self.default_ttl_s = float(default_ttl_s)
+        self.ttl_by_event_type = normalized_ttls
+        self.duplicate_cooldown_s = float(cooldown_s)
+        self._queue: list[_ScheduledNarration] = []
+        self._queued_keys: set[tuple[object, ...]] = set()
+        self._last_emitted_at: dict[tuple[object, ...], float] = {}
+        self._next_sequence = 0
+
+    @staticmethod
+    def _validate_duration(name: str, value: float, *, positive: bool = False) -> None:
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be finite and non-negative") from exc
+        minimum_is_valid = normalized > 0.0 if positive else normalized >= 0.0
+        if not math.isfinite(normalized) or not minimum_is_valid:
+            qualifier = "positive" if positive else "non-negative"
+            raise ValueError(f"{name} must be finite and {qualifier}")
+
+    @staticmethod
+    def _validate_now(now_s: float) -> float:
+        try:
+            normalized = float(now_s)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("now_s must be finite") from exc
+        if not math.isfinite(normalized):
+            raise ValueError("now_s must be finite")
+        return normalized
+
+    def _purge(self, now_s: float) -> None:
+        unexpired = [item for item in self._queue if item.expires_at_s > now_s]
+        if len(unexpired) != len(self._queue):
+            self._queue = unexpired
+            heapq.heapify(self._queue)
+            self._queued_keys = {item.deduplication_key for item in self._queue}
+
+        if self.duplicate_cooldown_s == 0.0:
+            self._last_emitted_at.clear()
+            return
+        self._last_emitted_at = {
+            key: emitted_at
+            for key, emitted_at in self._last_emitted_at.items()
+            if now_s < emitted_at or now_s - emitted_at < self.duplicate_cooldown_s
+        }
+
+    def _is_recent_duplicate(self, key: tuple[object, ...], now_s: float) -> bool:
+        emitted_at = self._last_emitted_at.get(key)
+        if emitted_at is None:
+            return False
+        return now_s < emitted_at or now_s - emitted_at < self.duplicate_cooldown_s
+
+    def _ttl_for(self, event: AnalysisEvent) -> float:
+        return self.ttl_by_event_type.get(event.event_type.strip().upper(), self.default_ttl_s)
+
+    def enqueue(
+        self,
+        events: AnalysisEvent | Sequence[AnalysisEvent],
+        *,
+        now_s: float,
+    ) -> None:
+        """Add new semantic candidates without dropping already queued messages."""
+        current_time = self._validate_now(now_s)
+        self._purge(current_time)
+        batch = [events] if isinstance(events, AnalysisEvent) else events
+        for event in batch:
+            narration = self.policy.candidate_for(event)
+            if narration is None:
+                continue
+            key = self.policy.deduplication_key(event, narration.message)
+            if key in self._queued_keys or self._is_recent_duplicate(key, current_time):
+                continue
+
+            ttl_s = self._ttl_for(event)
+            if ttl_s == 0.0:
+                continue
+            item = _ScheduledNarration(
+                priority=narration.priority,
+                sequence=self._next_sequence,
+                expires_at_s=current_time + ttl_s,
+                deduplication_key=key,
+                narration=narration,
+            )
+            self._next_sequence += 1
+
+            if len(self._queue) >= self.max_queue_size:
+                worst = max(self._queue, key=lambda queued: (queued.priority, queued.sequence))
+                if item.priority >= worst.priority:
+                    continue
+                self._queue.remove(worst)
+                heapq.heapify(self._queue)
+                self._queued_keys.remove(worst.deduplication_key)
+
+            heapq.heappush(self._queue, item)
+            self._queued_keys.add(key)
+
+    def pop_next(self, *, now_s: float) -> Narration | None:
+        """Return one highest-priority unexpired narration, retaining the rest."""
+        current_time = self._validate_now(now_s)
+        self._purge(current_time)
+        if not self._queue:
+            return None
+        item = heapq.heappop(self._queue)
+        self._queued_keys.remove(item.deduplication_key)
+        self._last_emitted_at[item.deduplication_key] = current_time
+        return item.narration
+
+    def reset(self) -> None:
+        """Clear queued and duplicate state at a connection or session boundary."""
+        self._queue.clear()
+        self._queued_keys.clear()
+        self._last_emitted_at.clear()
+        self._next_sequence = 0
+        self.policy.reset()
+
+    def __len__(self) -> int:
+        return len(self._queue)

@@ -86,6 +86,12 @@ class StableObjectEventEngine:
         self._raw_track_to_stable: dict[tuple[int, str, int], int] = {}
         self._next_stable_id = 1
 
+    def reset(self) -> None:
+        """Forget all tracked objects and restart stable-ID allocation."""
+        self._states.clear()
+        self._raw_track_to_stable.clear()
+        self._next_stable_id = 1
+
     @staticmethod
     def _object_key(state: _ObjectState) -> str:
         return f"{state.last_detection.class_name}:stable-{state.stable_id}"

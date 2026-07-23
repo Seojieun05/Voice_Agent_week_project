@@ -410,6 +410,19 @@ def test_update_frame_returns_stable_keys_aligned_to_detections() -> None:
     assert all(key.startswith("traffic light:stable-") for key in result.object_keys)
 
 
+def test_reset_forgets_tracks_and_restarts_stable_id_allocation() -> None:
+    engine = StableObjectEventEngine(min_seen_frames=1, max_missed_frames=1)
+    first = engine.update_frame([detection(0, 7)], 0.0)
+
+    engine.reset()
+    assert engine.update_frame([], 1 / 30).events == ()
+    restarted = engine.update_frame([detection(2, 7)], 2 / 30)
+
+    assert first.object_keys == ("traffic light:stable-1",)
+    assert restarted.object_keys == ("traffic light:stable-1",)
+    assert [event.event_type for event in restarted.events] == ["appeared"]
+
+
 def test_signal_state_configuration_and_alignment_are_validated() -> None:
     with pytest.raises(ValueError, match="min_signal_state_frames"):
         StableObjectEventEngine(min_signal_state_frames=0)

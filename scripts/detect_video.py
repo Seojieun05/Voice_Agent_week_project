@@ -93,6 +93,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="접근·정차 버스 번호 OCR 호출 사이의 최소 프레임 수",
     )
     parser.add_argument(
+        "--kiosk-ocr-interval-frames",
+        type=int,
+        default=1,
+        help="키오스크 OCR 호출 사이의 최소 처리 프레임 수",
+    )
+    parser.add_argument(
+        "--text-ocr-interval-frames",
+        type=int,
+        default=1,
+        help="표지판·화면 OCR 호출 사이의 최소 처리 프레임 수",
+    )
+    parser.add_argument(
         "--no-signal-state",
         action="store_true",
         help="실험용 빨강/초록/노랑/알 수 없음 분류를 비활성화",
@@ -193,6 +205,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="--vlm-model의 원격 가중치 다운로드를 명시적으로 허용",
     )
+    parser.add_argument(
+        "--narrate-presence-classes",
+        type=_parse_class_names,
+        default=(),
+        help="등장·사라짐 발화를 명시적으로 허용할 객체 클래스 목록",
+    )
+    parser.add_argument(
+        "--no-bus-approach-narration",
+        action="store_true",
+        help="버스 접근 이벤트는 기록하되 발화하지 않음",
+    )
     return parser
 
 
@@ -219,6 +242,8 @@ def main() -> int:
             bus_minimum_area_change_ratio=args.bus_minimum_area_change_ratio,
             bus_maximum_motion_frame_gap=args.bus_max_motion_frame_gap,
             bus_route_ocr_interval_frames=args.bus_route_ocr_interval_frames,
+            kiosk_ocr_interval_frames=args.kiosk_ocr_interval_frames,
+            text_ocr_interval_frames=args.text_ocr_interval_frames,
             classify_signal_states=not args.no_signal_state,
             min_signal_state_frames=args.min_signal_state_frames,
             signal_minimum_detection_confidence=(args.signal_minimum_detection_confidence),
@@ -234,6 +259,8 @@ def main() -> int:
             generic_vlm_device=args.vlm_device,
             allow_vlm_download=args.allow_vlm_download,
             generic_vlm_classes=args.vlm_classes,
+            narration_presence_classes=args.narrate_presence_classes,
+            narrate_bus_approach=not args.no_bus_approach_narration,
         )
         summary = run_video_pipeline(config)
     except (FileNotFoundError, RuntimeError, ValueError, argparse.ArgumentTypeError) as exc:

@@ -13,6 +13,17 @@ from ..signals import (
 from ..types import AnalysisResult, Detection, SignalState
 
 
+def _bounded_confidence(value: object) -> float:
+    """Normalize external evidence to a conservative unit-interval score."""
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        return 0.0
+    return confidence
+
+
 @dataclass(slots=True)
 class _SignalHistory:
     confirmed_state: SignalState | None = None
@@ -69,7 +80,7 @@ class TrafficLightAnalyzer:
             return SignalState.UNKNOWN, 0.0, 0.0, 0.0, 0.0
         return (
             TrafficLightAnalyzer._as_signal_state(result.state),
-            float(result.confidence),
+            _bounded_confidence(result.confidence),
             float(result.red_ratio),
             float(result.green_ratio),
             float(getattr(result, "yellow_ratio", 0.0)),
@@ -146,14 +157,8 @@ class TrafficLightAnalyzer:
     ) -> AnalysisResult:
         result = precomputed_signal_result
         disabled_reason: str | None = None
-        try:
-            detection_confidence = float(detection.confidence)
-        except (TypeError, ValueError):
-            detection_confidence = 0.0
-        detection_is_reliable = (
-            math.isfinite(detection_confidence)
-            and detection_confidence >= self.minimum_detection_confidence
-        )
+        detection_confidence = _bounded_confidence(detection.confidence)
+        detection_is_reliable = detection_confidence >= self.minimum_detection_confidence
         if not self.enabled:
             result = None
             disabled_reason = "signal_state_analysis_disabled"
@@ -168,7 +173,7 @@ class TrafficLightAnalyzer:
             else:
                 result = self.classifier.classify(crop)
 
-        observed, raw_confidence, red_ratio, green_ratio, yellow_ratio = self._evidence(result)
+        observed, evidence_confidence, red_ratio, green_ratio, yellow_ratio = self._evidence(result)
         history = self._history_by_stable_id.setdefault(stable_id, _SignalHistory())
         observations_are_consecutive = self._start_frame(history, detection.frame_index)
         state, previous_state, changed, is_uncertain = self._observe(
@@ -187,7 +192,11 @@ class TrafficLightAnalyzer:
             "detection_confidence": detection_confidence,
             "minimum_detection_confidence": self.minimum_detection_confidence,
             "observed_state": observed.value,
-            "signal_state_confidence": raw_confidence,
+            # Keep detector and HSV evidence separate. The HSV score measures
+            # relative color evidence and is not treated as a calibrated
+            # probability or allowed to override weak detector evidence.
+            "signal_state_confidence": evidence_confidence,
+            "signal_evidence_confidence": evidence_confidence,
             "red_ratio": red_ratio,
             "green_ratio": green_ratio,
             "yellow_ratio": yellow_ratio,
@@ -206,7 +215,8 @@ class TrafficLightAnalyzer:
         if disabled_reason is not None:
             attributes["reason"] = disabled_reason
 
-        confidence = raw_confidence if not is_uncertain else 0.0
+        confidence = min(detection_confidence, evidence_confidence) if not is_uncertain else 0.0
+        attributes["combined_confidence"] = confidence
         return AnalysisResult(
             object_type=object_type,
             stable_id=stable_id,

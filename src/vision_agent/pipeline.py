@@ -19,7 +19,7 @@ from .analyzers import (
 from .event_manager import OBJECT_APPROACHING, SceneEventManager
 from .events import StableObjectEventEngine
 from .io import JsonlWriter
-from .narration import NarrationPolicy
+from .narration import Narration, NarrationPolicy, NarrationScheduler
 from .ocr import OcrEngine, RapidOcrEngine, UnavailableOcrEngine
 from .router import ObjectRouter
 from .signals import (
@@ -31,7 +31,7 @@ from .signals import (
     SignalTargetSelector,
     crop_frame_to_bbox,
 )
-from .types import AnalysisResult, Detection, SignalState
+from .types import AnalysisEvent, AnalysisResult, Detection, SceneEvent, SignalState
 from .vlm import TransformersVisionLanguageModel
 
 
@@ -58,6 +58,8 @@ class PipelineConfig:
     bus_maximum_motion_frame_gap: int = 2
     bus_route_ocr_interval_frames: int = 7
     bus_route_ocr_requires_relevant_motion: bool = True
+    kiosk_ocr_interval_frames: int = 1
+    text_ocr_interval_frames: int = 1
     classify_signal_states: bool = True
     min_signal_state_frames: int = 3
     signal_minimum_detection_confidence: float = 0.2
@@ -77,6 +79,46 @@ class PipelineConfig:
         "unknown_object",
         "unknown_panel",
     )
+    narration_presence_classes: tuple[str, ...] = ()
+    narrate_bus_approach: bool = True
+    narration_queue_size: int = 32
+    narration_ttl_s: float = 5.0
+
+
+@dataclass(frozen=True, slots=True)
+class FrameContext:
+    """Timing and ordering metadata for one frame accepted by a session."""
+
+    source_sequence_id: int
+    processed_index: int
+    captured_at_s: float | None
+    received_at_s: float
+    processing_started_at_s: float
+    dropped_frames: int = 0
+
+
+@dataclass(slots=True)
+class FrameAnalysis:
+    """One shared frame result used by both MP4 and live transports."""
+
+    source_sequence_id: int
+    processed_index: int
+    timestamp_s: float
+    detections: list[Detection]
+    scene_events: list[SceneEvent]
+    analysis_results: list[AnalysisResult]
+    analysis_events: list[AnalysisEvent]
+    narrations: list[str]
+    timings: dict[str, float]
+    dropped_frames: int
+    stable_keys_by_index: dict[int, str]
+    signal_detection_indices: set[int]
+    selected_signal_indices: set[int]
+    signal_results_by_index: dict[int, SignalStateResult]
+    analysis_results_by_index: dict[int, AnalysisResult]
+    object_crops_by_index: dict[int, ImageArray]
+    retired_object_keys: tuple[str, ...]
+    selected_narrations: list[Narration]
 
 
 def _build_ocr_engine(config: PipelineConfig) -> OcrEngine:
@@ -129,8 +171,14 @@ def _build_object_router(
             route_ocr_interval_frames=config.bus_route_ocr_interval_frames,
             route_ocr_requires_relevant_motion=config.bus_route_ocr_requires_relevant_motion,
         ),
-        kiosk_analyzer=KioskAnalyzer(ocr_engine=ocr_engine),
-        text_object_analyzer=TextObjectAnalyzer(ocr_engine=ocr_engine),
+        kiosk_analyzer=KioskAnalyzer(
+            ocr_engine=ocr_engine,
+            ocr_interval_frames=config.kiosk_ocr_interval_frames,
+        ),
+        text_object_analyzer=TextObjectAnalyzer(
+            ocr_engine=ocr_engine,
+            ocr_interval_frames=config.text_ocr_interval_frames,
+        ),
         generic_vision_analyzer=GenericVisionAnalyzer(
             model=generic_model,
             allowed_object_types=config.generic_vlm_classes,
@@ -437,58 +485,249 @@ def _draw_detection(
     )
 
 
-def run_video_pipeline(
+def _frame_timestamp_s(context: FrameContext) -> float:
+    candidate = context.captured_at_s
+    if candidate is None or not math.isfinite(candidate) or candidate < 0.0:
+        candidate = context.received_at_s
+    if not math.isfinite(candidate) or candidate < 0.0:
+        return 0.0
+    return float(candidate)
+
+
+class VisionSession:
+    """Stateful frame processor shared by file and live transports."""
+
+    def __init__(
+        self,
+        *,
+        model: Any,
+        track: bool,
+        tracker: str,
+        predict_kwargs: dict[str, Any],
+        event_engine: StableObjectEventEngine,
+        signal_target_selector: SignalTargetSelector,
+        signal_classifier: SignalStateClassifier | None,
+        object_router: ObjectRouter,
+        scene_event_manager: SceneEventManager,
+        narration_scheduler: NarrationScheduler,
+        maximum_state_gap_s: float | None = None,
+        model_load_ms: float = 0.0,
+    ) -> None:
+        if maximum_state_gap_s is not None and (
+            not math.isfinite(maximum_state_gap_s) or maximum_state_gap_s <= 0.0
+        ):
+            raise ValueError("maximum_state_gap_s must be positive when provided")
+        self.model = model
+        self.track = track
+        self.tracker = tracker
+        self.predict_kwargs = dict(predict_kwargs)
+        self.event_engine = event_engine
+        self.signal_target_selector = signal_target_selector
+        self.signal_classifier = signal_classifier
+        self.object_router = object_router
+        self.scene_event_manager = scene_event_manager
+        self.narration_scheduler = narration_scheduler
+        self.maximum_state_gap_s = maximum_state_gap_s
+        self.model_load_ms = model_load_ms
+        self._last_processing_started_at_s: float | None = None
+        self.processed_frames = 0
+
+    def _reset_tracker(self) -> None:
+        predictor = getattr(self.model, "predictor", None)
+        trackers = getattr(predictor, "trackers", ()) if predictor is not None else ()
+        for tracker in trackers or ():
+            reset = getattr(tracker, "reset", None)
+            if callable(reset):
+                reset()
+
+    def _reset_state(self) -> None:
+        self._reset_tracker()
+        self.event_engine.reset()
+        self.signal_target_selector.reset()
+        self.object_router.reset()
+        self.scene_event_manager.reset()
+        self.narration_scheduler.reset()
+
+    def reset(self) -> None:
+        """Clear tracker, analyzer, event, and narration state for session reuse."""
+        self._reset_state()
+        self._last_processing_started_at_s = None
+        self.processed_frames = 0
+
+    def _reset_after_long_gap(self, processing_started_at_s: float) -> None:
+        previous = self._last_processing_started_at_s
+        if (
+            previous is not None
+            and self.maximum_state_gap_s is not None
+            and processing_started_at_s - previous > self.maximum_state_gap_s
+        ):
+            self._reset_state()
+        self._last_processing_started_at_s = processing_started_at_s
+
+    def process_frame(
+        self,
+        frame: ImageArray,
+        context: FrameContext,
+    ) -> FrameAnalysis:
+        """Analyze one decoded frame without owning its transport or persistence."""
+        if frame.ndim != 3 or frame.shape[2] != 3 or frame.size == 0:
+            raise ValueError("frame must be a non-empty BGR image")
+        if context.processed_index < 0:
+            raise ValueError("processed_index must be non-negative")
+
+        self._reset_after_long_gap(context.processing_started_at_s)
+        timestamp_s = _frame_timestamp_s(context)
+        processing_started_at = time.perf_counter()
+
+        inference_started_at = time.perf_counter()
+        if self.track:
+            results = self.model.track(
+                frame,
+                persist=True,
+                tracker=self.tracker,
+                **self.predict_kwargs,
+            )
+        else:
+            results = self.model.predict(frame, **self.predict_kwargs)
+        inference_ms = (time.perf_counter() - inference_started_at) * 1000.0
+
+        analysis_started_at = time.perf_counter()
+        result = results[0]
+        detections = _build_detection_list(
+            result,
+            context.processed_index,
+            timestamp_s,
+        )
+        signal_detection_indices = {
+            index
+            for index, detection in enumerate(detections)
+            if self.signal_target_selector.is_signal_detection(detection)
+        }
+        selected_signal_indices = set(self.signal_target_selector.select_indices(detections))
+        event_indices = [
+            index
+            for index in range(len(detections))
+            if index not in signal_detection_indices or index in selected_signal_indices
+        ]
+        event_detections = [detections[index] for index in event_indices]
+
+        signal_results_by_index: dict[int, SignalStateResult] = {}
+        object_crops_by_index: dict[int, ImageArray] = {}
+        signal_states: list[SignalState | None] = []
+        for detection_index in event_indices:
+            detection = detections[detection_index]
+            crop = crop_frame_to_bbox(frame, detection.xyxy)
+            if crop is not None:
+                object_crops_by_index[detection_index] = crop
+            if detection_index not in selected_signal_indices or self.signal_classifier is None:
+                signal_states.append(None)
+                continue
+
+            signal_result = (
+                SignalStateResult(
+                    state=SignalState.UNKNOWN,
+                    confidence=0.0,
+                    red_ratio=0.0,
+                    green_ratio=0.0,
+                    yellow_ratio=0.0,
+                )
+                if crop is None
+                else self.signal_classifier.classify(crop)
+            )
+            signal_results_by_index[detection_index] = signal_result
+            signal_states.append(signal_result.state)
+
+        frame_update = self.event_engine.update_frame(
+            event_detections,
+            timestamp_s,
+            signal_states=signal_states,
+        )
+        scene_events = list(frame_update.events)
+        stable_keys_by_index = {
+            detection_index: stable_key
+            for detection_index, stable_key in zip(
+                event_indices,
+                frame_update.object_keys,
+                strict=True,
+            )
+        }
+        analysis_results_by_index: dict[int, AnalysisResult] = {}
+        for detection_index in event_indices:
+            stable_object_key = stable_keys_by_index[detection_index]
+            analysis_results_by_index[detection_index] = self.object_router.route_detection(
+                detections[detection_index],
+                stable_id=stable_object_key.rsplit(":", maxsplit=1)[-1],
+                crop=object_crops_by_index.get(detection_index),
+                precomputed_signal_result=signal_results_by_index.get(detection_index),
+            )
+        analysis_results = [analysis_results_by_index[index] for index in event_indices]
+        analysis_events = self.scene_event_manager.update(
+            analysis_results,
+            timestamp_s,
+            scene_events=scene_events,
+        )
+
+        self.narration_scheduler.enqueue(analysis_events, now_s=timestamp_s)
+        selected = self.narration_scheduler.pop_next(now_s=timestamp_s)
+        selected_narrations = [selected] if selected is not None else []
+        narrations = [narration.message for narration in selected_narrations]
+
+        for retired_object_key in frame_update.retired_object_keys:
+            retired_stable_id = retired_object_key.rsplit(":", maxsplit=1)[-1]
+            self.object_router.reset(retired_stable_id)
+            self.scene_event_manager.reset(retired_stable_id)
+
+        analysis_ms = (time.perf_counter() - analysis_started_at) * 1000.0
+        total_processing_ms = (time.perf_counter() - processing_started_at) * 1000.0
+        self.processed_frames += 1
+        return FrameAnalysis(
+            source_sequence_id=context.source_sequence_id,
+            processed_index=context.processed_index,
+            timestamp_s=timestamp_s,
+            detections=detections,
+            scene_events=scene_events,
+            analysis_results=analysis_results,
+            analysis_events=analysis_events,
+            narrations=narrations,
+            timings={
+                "inference_ms": inference_ms,
+                "analysis_ms": analysis_ms,
+                "total_processing_ms": total_processing_ms,
+            },
+            dropped_frames=context.dropped_frames,
+            stable_keys_by_index=stable_keys_by_index,
+            signal_detection_indices=signal_detection_indices,
+            selected_signal_indices=selected_signal_indices,
+            signal_results_by_index=signal_results_by_index,
+            analysis_results_by_index=analysis_results_by_index,
+            object_crops_by_index=object_crops_by_index,
+            retired_object_keys=frame_update.retired_object_keys,
+            selected_narrations=selected_narrations,
+        )
+
+
+def create_vision_session(
     config: PipelineConfig,
     *,
+    live_mode: bool = False,
+    tracker_override: str | None = None,
+    maximum_state_gap_s: float | None = None,
+    narrate_bus_approach: bool | None = None,
+    model: Any | None = None,
     signal_classifier: SignalStateClassifier | None = None,
     object_router: ObjectRouter | None = None,
     scene_event_manager: SceneEventManager | None = None,
     narration_policy: NarrationPolicy | None = None,
-) -> dict[str, Any]:
-    source_path = Path(config.source)
-    if not source_path.exists():
-        raise FileNotFoundError(f"입력 영상을 찾을 수 없습니다: {source_path}")
-
+    narration_scheduler: NarrationScheduler | None = None,
+) -> VisionSession:
+    """Build one isolated stateful runtime without opening a video source."""
     resolved_device = resolve_device(config.device)
-    config.output_dir.mkdir(parents=True, exist_ok=True)
-    stem = source_path.stem
-    output_video = config.output_dir / f"{stem}_annotated.mp4"
-    output_jsonl = config.output_dir / f"{stem}_detections.jsonl"
-    crops_dir = config.output_dir / f"{stem}_crops"
-    if config.save_crops:
-        crops_dir.mkdir(parents=True, exist_ok=True)
+    model_load_ms = 0.0
+    if model is None:
+        model_load_started_at = time.perf_counter()
+        model = _load_yolo(config.model)
+        model_load_ms = (time.perf_counter() - model_load_started_at) * 1000.0
 
-    model = _load_yolo(config.model)
-    capture = cv2.VideoCapture(str(source_path))
-    if not capture.isOpened():
-        raise RuntimeError(f"영상을 열 수 없습니다: {source_path}")
-
-    source_fps = _read_source_fps(capture)
-    processing_fps = source_fps if source_fps > 0 else 30.0
-    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    if width <= 0 or height <= 0:
-        capture.release()
-        raise RuntimeError("영상의 해상도를 읽지 못했습니다.")
-
-    writer = cv2.VideoWriter(
-        str(output_video),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        processing_fps,
-        (width, height),
-    )
-    if not writer.isOpened():
-        capture.release()
-        raise RuntimeError(f"결과 영상을 생성할 수 없습니다: {output_video}")
-
-    event_engine = StableObjectEventEngine(
-        min_seen_frames=config.min_seen_frames,
-        max_missed_frames=config.max_missed_frames,
-        reconnect_iou_threshold=config.reconnect_iou_threshold,
-        max_reconnect_frames=config.max_reconnect_frames,
-        min_signal_state_frames=config.min_signal_state_frames,
-    )
-    signal_target_selector = SignalTargetSelector()
     if not config.classify_signal_states:
         signal_classifier = None
     elif signal_classifier is None:
@@ -501,8 +740,21 @@ def run_video_pipeline(
         )
     if object_router is None:
         object_router = _build_object_router(config, signal_classifier)
+
+    effective_bus_narration = (
+        config.narrate_bus_approach if narrate_bus_approach is None else narrate_bus_approach
+    )
     if narration_policy is None:
-        narration_policy = NarrationPolicy()
+        narration_policy = NarrationPolicy(
+            presence_narration_object_types=config.narration_presence_classes,
+            allow_bus_approach=effective_bus_narration,
+        )
+    if narration_scheduler is None:
+        narration_scheduler = NarrationScheduler(
+            narration_policy,
+            max_queue_size=config.narration_queue_size,
+            default_ttl_s=config.narration_ttl_s,
+        )
     if scene_event_manager is None:
         scene_event_manager = SceneEventManager(
             auto_presence=False,
@@ -511,6 +763,92 @@ def run_video_pipeline(
             minimum_presence_confidence=narration_policy.minimum_confidence,
             minimum_domain_confidence=narration_policy.minimum_confidence,
         )
+
+    predict_kwargs: dict[str, Any] = {
+        "conf": config.confidence,
+        "imgsz": config.image_size,
+        "device": resolved_device,
+        "verbose": False,
+    }
+    if config.classes is not None:
+        predict_kwargs["classes"] = list(config.classes)
+
+    tracker = tracker_override or ("botsort.yaml" if live_mode else config.tracker)
+    effective_gap_s = 2.0 if live_mode and maximum_state_gap_s is None else maximum_state_gap_s
+    return VisionSession(
+        model=model,
+        track=config.track,
+        tracker=tracker,
+        predict_kwargs=predict_kwargs,
+        event_engine=StableObjectEventEngine(
+            min_seen_frames=config.min_seen_frames,
+            max_missed_frames=config.max_missed_frames,
+            reconnect_iou_threshold=config.reconnect_iou_threshold,
+            max_reconnect_frames=config.max_reconnect_frames,
+            min_signal_state_frames=config.min_signal_state_frames,
+        ),
+        signal_target_selector=SignalTargetSelector(),
+        signal_classifier=signal_classifier,
+        object_router=object_router,
+        scene_event_manager=scene_event_manager,
+        narration_scheduler=narration_scheduler,
+        maximum_state_gap_s=effective_gap_s,
+        model_load_ms=model_load_ms,
+    )
+
+
+def run_video_pipeline(
+    config: PipelineConfig,
+    *,
+    signal_classifier: SignalStateClassifier | None = None,
+    object_router: ObjectRouter | None = None,
+    scene_event_manager: SceneEventManager | None = None,
+    narration_policy: NarrationPolicy | None = None,
+) -> dict[str, Any]:
+    source_path = Path(config.source)
+    if not source_path.exists():
+        raise FileNotFoundError(f"입력 영상을 찾을 수 없습니다: {source_path}")
+
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    stem = source_path.stem
+    output_video = config.output_dir / f"{stem}_annotated.mp4"
+    output_jsonl = config.output_dir / f"{stem}_detections.jsonl"
+    crops_dir = config.output_dir / f"{stem}_crops"
+    if config.save_crops:
+        crops_dir.mkdir(parents=True, exist_ok=True)
+
+    session = create_vision_session(
+        config,
+        live_mode=False,
+        signal_classifier=signal_classifier,
+        object_router=object_router,
+        scene_event_manager=scene_event_manager,
+        narration_policy=narration_policy,
+    )
+    capture = cv2.VideoCapture(str(source_path))
+    if not capture.isOpened():
+        session.reset()
+        raise RuntimeError(f"영상을 열 수 없습니다: {source_path}")
+
+    source_fps = _read_source_fps(capture)
+    processing_fps = source_fps if source_fps > 0 else 30.0
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if width <= 0 or height <= 0:
+        capture.release()
+        session.reset()
+        raise RuntimeError("영상의 해상도를 읽지 못했습니다.")
+
+    writer = cv2.VideoWriter(
+        str(output_video),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        processing_fps,
+        (width, height),
+    )
+    if not writer.isOpened():
+        capture.release()
+        session.reset()
+        raise RuntimeError(f"결과 영상을 생성할 수 없습니다: {output_video}")
 
     frame_index = 0
     detection_count = 0
@@ -532,14 +870,6 @@ def run_video_pipeline(
     last_timestamp_s: float | None = None
     started_at = time.perf_counter()
 
-    predict_kwargs: dict[str, Any] = {
-        "conf": config.confidence,
-        "imgsz": config.image_size,
-        "device": resolved_device,
-        "verbose": False,
-    }
-    if config.classes is not None:
-        predict_kwargs["classes"] = list(config.classes)
     try:
         with JsonlWriter(output_jsonl) as jsonl:
             while True:
@@ -555,87 +885,26 @@ def run_video_pipeline(
                 )
                 previous_timestamp_s = timestamp_s
                 last_timestamp_s = timestamp_s
-                inference_started_at = time.perf_counter()
-                if config.track:
-                    results = model.track(
-                        frame,
-                        persist=True,
-                        tracker=config.tracker,
-                        **predict_kwargs,
-                    )
-                else:
-                    results = model.predict(frame, **predict_kwargs)
-                inference_ms = (time.perf_counter() - inference_started_at) * 1000
+                received_at_s = time.perf_counter()
+                frame_analysis = session.process_frame(
+                    frame,
+                    FrameContext(
+                        source_sequence_id=frame_index,
+                        processed_index=frame_index,
+                        captured_at_s=timestamp_s,
+                        received_at_s=received_at_s,
+                        processing_started_at_s=received_at_s,
+                    ),
+                )
+
+                detections = frame_analysis.detections
+                events = frame_analysis.scene_events
+                analysis_results = frame_analysis.analysis_results
+                analysis_events = frame_analysis.analysis_events
+                narrations = frame_analysis.narrations
+                inference_ms = frame_analysis.timings["inference_ms"]
                 inference_ms_values.append(inference_ms)
 
-                result = results[0]
-                detections = _build_detection_list(result, frame_index, timestamp_s)
-                signal_detection_indices = {
-                    index
-                    for index, detection in enumerate(detections)
-                    if signal_target_selector.is_signal_detection(detection)
-                }
-                selected_signal_indices = set(signal_target_selector.select_indices(detections))
-                event_indices = [
-                    index
-                    for index in range(len(detections))
-                    if index not in signal_detection_indices or index in selected_signal_indices
-                ]
-                event_detections = [detections[index] for index in event_indices]
-                signal_results_by_index: dict[int, SignalStateResult] = {}
-                object_crops_by_index: dict[int, ImageArray] = {}
-                signal_states: list[SignalState | None] = []
-                for detection_index in event_indices:
-                    detection = detections[detection_index]
-                    crop = crop_frame_to_bbox(frame, detection.xyxy)
-                    if crop is not None:
-                        object_crops_by_index[detection_index] = crop
-                    if detection_index not in selected_signal_indices:
-                        signal_states.append(None)
-                        continue
-
-                    if signal_classifier is None:
-                        signal_states.append(None)
-                        continue
-
-                    if crop is None:
-                        signal_result = SignalStateResult(
-                            state=SignalState.UNKNOWN,
-                            confidence=0.0,
-                            red_ratio=0.0,
-                            green_ratio=0.0,
-                            yellow_ratio=0.0,
-                        )
-                    else:
-                        signal_result = signal_classifier.classify(crop)
-                    signal_results_by_index[detection_index] = signal_result
-                    signal_states.append(signal_result.state)
-                    signal_state_counts[signal_result.state.value] += 1
-
-                frame_update = event_engine.update_frame(
-                    event_detections,
-                    timestamp_s,
-                    signal_states=signal_states,
-                )
-                events = list(frame_update.events)
-                stable_keys_by_index = {
-                    detection_index: stable_key
-                    for detection_index, stable_key in zip(
-                        event_indices,
-                        frame_update.object_keys,
-                        strict=True,
-                    )
-                }
-                analysis_results_by_index: dict[int, AnalysisResult] = {}
-                for detection_index in event_indices:
-                    stable_object_key = stable_keys_by_index[detection_index]
-                    analysis_results_by_index[detection_index] = object_router.route_detection(
-                        detections[detection_index],
-                        stable_id=stable_object_key.rsplit(":", maxsplit=1)[-1],
-                        crop=object_crops_by_index.get(detection_index),
-                        precomputed_signal_result=signal_results_by_index.get(detection_index),
-                    )
-                analysis_results = [analysis_results_by_index[index] for index in event_indices]
                 bus_results = [result for result in analysis_results if result.object_type == "bus"]
                 if bus_results:
                     bus_detection_frame_count += 1
@@ -648,35 +917,32 @@ def run_video_pipeline(
                     route_number = bus_result.attributes.get("route_number")
                     if route_number is not None and str(route_number).strip():
                         bus_route_numbers.add(str(route_number).strip())
-                analysis_events = scene_event_manager.update(
-                    analysis_results,
-                    timestamp_s,
-                    scene_events=events,
-                )
-                selected_narrations = narration_policy.select(analysis_events)
-                narrations = [narration.message for narration in selected_narrations]
+
                 detection_count += len(detections)
                 event_count += len(events)
                 analysis_event_count += len(analysis_events)
                 narration_count += len(narrations)
                 signal_change_count += sum(event.event_type == "signal_changed" for event in events)
-                signal_target_count += len(selected_signal_indices)
+                signal_target_count += len(frame_analysis.selected_signal_indices)
+                for signal_result in frame_analysis.signal_results_by_index.values():
+                    signal_state_counts[signal_result.state.value] += 1
                 bus_approach_event_count += sum(
                     event.event_type == OBJECT_APPROACHING and event.object_type == "bus"
                     for event in analysis_events
                 )
 
                 if config.save_crops:
-                    for detection_index in selected_signal_indices:
-                        crop = object_crops_by_index.get(detection_index)
-                        if crop is None:
+                    for detection_index in frame_analysis.selected_signal_indices:
+                        crop = frame_analysis.object_crops_by_index.get(detection_index)
+                        stable_key = frame_analysis.stable_keys_by_index.get(detection_index)
+                        if crop is None or stable_key is None:
                             continue
                         detection = detections[detection_index]
                         _save_signal_crop(
                             crops_dir,
                             crop=crop,
                             frame_index=frame_index,
-                            stable_object_key=stable_keys_by_index[detection_index],
+                            stable_object_key=stable_key,
                             confidence=detection.confidence,
                         )
 
@@ -688,14 +954,16 @@ def run_video_pipeline(
                         "detections": [
                             _build_detection_payload(
                                 detection,
-                                stable_object_key=stable_keys_by_index.get(index),
+                                stable_object_key=(frame_analysis.stable_keys_by_index.get(index)),
                                 is_signal_target=(
-                                    index in selected_signal_indices
-                                    if index in signal_detection_indices
+                                    index in frame_analysis.selected_signal_indices
+                                    if index in frame_analysis.signal_detection_indices
                                     else None
                                 ),
-                                signal_result=signal_results_by_index.get(index),
-                                analysis_result=analysis_results_by_index.get(index),
+                                signal_result=(frame_analysis.signal_results_by_index.get(index)),
+                                analysis_result=(
+                                    frame_analysis.analysis_results_by_index.get(index)
+                                ),
                             )
                             for index, detection in enumerate(detections)
                         ],
@@ -706,33 +974,34 @@ def run_video_pipeline(
                     }
                 )
 
-                for retired_object_key in frame_update.retired_object_keys:
-                    retired_stable_id = retired_object_key.rsplit(":", maxsplit=1)[-1]
-                    object_router.reset(retired_stable_id)
-                    scene_event_manager.reset(retired_stable_id)
-
-                for narration in selected_narrations:
+                for narration in frame_analysis.selected_narrations:
                     print(f"[{narration.event.timestamp_s:7.2f}s] {narration.message}")
 
                 plotted = frame.copy()
                 visible_indices = [
                     index
                     for index in range(len(detections))
-                    if index not in signal_detection_indices or index in selected_signal_indices
+                    if index not in frame_analysis.signal_detection_indices
+                    or index in frame_analysis.selected_signal_indices
                 ]
                 for detection_index in visible_indices:
                     _draw_detection(
                         plotted,
                         detections[detection_index],
-                        stable_object_key=stable_keys_by_index.get(detection_index),
-                        signal_result=signal_results_by_index.get(detection_index),
-                        analysis_result=analysis_results_by_index.get(detection_index),
+                        stable_object_key=(
+                            frame_analysis.stable_keys_by_index.get(detection_index)
+                        ),
+                        signal_result=(frame_analysis.signal_results_by_index.get(detection_index)),
+                        analysis_result=(
+                            frame_analysis.analysis_results_by_index.get(detection_index)
+                        ),
                     )
                 writer.write(plotted)
                 frame_index += 1
     finally:
         capture.release()
         writer.release()
+        session.reset()
 
     elapsed_s = time.perf_counter() - started_at
     performance_summary = _build_performance_summary(
@@ -747,6 +1016,8 @@ def run_video_pipeline(
         "source": str(source_path),
         "model": config.model,
         "classes": list(config.classes) if config.classes is not None else None,
+        "tracker": config.tracker if config.track else None,
+        "model_load_ms": round(session.model_load_ms, 3),
         "ocr_backend": config.ocr_backend,
         "ocr_language": config.ocr_language,
         "generic_vlm_enabled": bool(

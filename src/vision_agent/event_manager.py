@@ -202,8 +202,22 @@ class SceneEventManager:
                 and detection_confidence < minimum_detection_confidence
             ):
                 return 0.0
-            return _confidence(result.confidence, 0.0)
+            signal_evidence_confidence = result.attributes.get(
+                "signal_evidence_confidence",
+                result.attributes.get("signal_state_confidence", result.confidence),
+            )
+            return cls._combined_evidence_confidence(result, signal_evidence_confidence)
         return cls._combined_evidence_confidence(result, result.confidence)
+
+    def _state_confidence_is_sufficient(
+        self,
+        object_type: str,
+        confidence: float,
+    ) -> bool:
+        """Keep confirmed signal transitions even when they are not narratable."""
+        if _normalize_object_type(object_type) in SIGNAL_OBJECT_TYPES:
+            return confidence > 0.0
+        return confidence >= self.minimum_domain_confidence
 
     def _forget_object(self, stable_id: str, *, remove_deduplication: bool = False) -> None:
         self._active_results.pop(stable_id, None)
@@ -426,7 +440,7 @@ class SceneEventManager:
         current_state = _normalize_state(scene_event.current_state)
         if previous_state is None or current_state is None or previous_state == current_state:
             return
-        if confidence < self.minimum_domain_confidence:
+        if not self._state_confidence_is_sufficient(object_type, confidence):
             return
 
         # The existing event engine is authoritative for pipeline timing. Accept
@@ -491,7 +505,7 @@ class SceneEventManager:
             if (
                 self.derive_state_changes
                 and observed_state is not None
-                and state_confidence >= self.minimum_domain_confidence
+                and self._state_confidence_is_sufficient(result.object_type, state_confidence)
             ):
                 if previous_state is not None and observed_state != previous_state:
                     changed = self._event_from_result(
@@ -500,6 +514,7 @@ class SceneEventManager:
                         timestamp_s,
                         previous_state=previous_state,
                         current_state=observed_state,
+                        confidence=state_confidence,
                     )
                     self._append_once(events, changed)
                 self._known_states[stable_id] = observed_state

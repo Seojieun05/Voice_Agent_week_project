@@ -128,9 +128,7 @@ def test_small_or_missing_text_region_is_never_confirmed(
 
     assert all(item.is_uncertain for item in analyses)
     assert analyses[-1].attributes["text"] is None
-    assert analyses[-1].attributes["reason"] == (
-        "ocr_text_region_too_small_or_unavailable"
-    )
+    assert analyses[-1].attributes["reason"] == ("ocr_text_region_too_small_or_unavailable")
 
 
 def test_different_digits_are_not_merged_as_similar_text() -> None:
@@ -197,6 +195,53 @@ def test_missing_video_frame_breaks_candidate_streak() -> None:
     assert [item.attributes["ocr_candidate_frames"] for item in analyses] == [1, 2, 1, 2]
     assert all(item.is_uncertain for item in analyses)
     assert analyses[2].attributes["observations_are_consecutive"] is False
+
+
+def test_ocr_interval_skips_calls_without_adding_text_votes() -> None:
+    engine = SequenceOcrEngine([result("출구")] * 3)
+    analyzer = TextObjectAnalyzer(
+        engine,
+        minimum_confirmed_frames=3,
+        ocr_interval_frames=2,
+    )
+
+    analyses = analyze_frames(analyzer, [0, 1, 2, 3, 4])
+
+    assert engine.calls == 3
+    assert [item.attributes["ocr_was_run"] for item in analyses] == [
+        True,
+        False,
+        True,
+        False,
+        True,
+    ]
+    assert [item.attributes["ocr_candidate_frames"] for item in analyses] == [
+        1,
+        1,
+        2,
+        2,
+        3,
+    ]
+    assert analyses[1].attributes["reason"] == "ocr_deferred"
+    assert all(item.is_uncertain for item in analyses[:-1])
+    assert analyses[-1].attributes["text"] == "출구"
+
+
+def test_processed_frame_gap_resets_throttled_text_votes_and_runs_ocr_immediately() -> None:
+    engine = SequenceOcrEngine([result("출구")] * 3)
+    analyzer = TextObjectAnalyzer(
+        engine,
+        minimum_confirmed_frames=2,
+        ocr_interval_frames=3,
+    )
+
+    analyses = analyze_frames(analyzer, [0, 1, 3, 4, 5, 6])
+
+    assert engine.calls == 3
+    assert analyses[2].attributes["ocr_was_run"] is True
+    assert analyses[2].attributes["ocr_candidate_frames"] == 1
+    assert analyses[2].is_uncertain is True
+    assert analyses[-1].attributes["text"] == "출구"
 
 
 def test_missing_or_small_crop_does_not_call_ocr_engine() -> None:
@@ -326,6 +371,8 @@ def test_unicode_case_and_whitespace_normalization_stabilizes_text() -> None:
         ("minimum_text_width", 0),
         ("minimum_text_height", True),
         ("minimum_text_pixels", -1),
+        ("ocr_interval_frames", 0),
+        ("ocr_interval_frames", True),
     ],
 )
 def test_invalid_configuration_is_rejected(keyword: str, value: object) -> None:

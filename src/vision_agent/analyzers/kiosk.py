@@ -87,6 +87,10 @@ class _KioskHistory:
     candidate_fingerprint: str | None = None
     candidate_fingerprint_frames: int = 0
     last_frame_index: int | None = None
+    last_ocr_frame: int | None = None
+    last_ocr_lines: tuple[str, ...] = ()
+    last_ocr_confidence: float = 0.0
+    last_button_candidates: tuple[dict[str, object], ...] = ()
 
 
 def _normalize_display_text(value: object) -> str:
@@ -165,6 +169,7 @@ class KioskAnalyzer:
         minimum_ocr_confidence: float = 0.6,
         minimum_confirmed_frames: int = 3,
         minimum_screen_change_frames: int = 3,
+        ocr_interval_frames: int = 1,
     ) -> None:
         for name, value in (
             ("minimum_detection_confidence", minimum_detection_confidence),
@@ -175,6 +180,7 @@ class KioskAnalyzer:
         for name, value in (
             ("minimum_confirmed_frames", minimum_confirmed_frames),
             ("minimum_screen_change_frames", minimum_screen_change_frames),
+            ("ocr_interval_frames", ocr_interval_frames),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
@@ -184,6 +190,7 @@ class KioskAnalyzer:
         self.minimum_ocr_confidence = minimum_ocr_confidence
         self.minimum_confirmed_frames = minimum_confirmed_frames
         self.minimum_screen_change_frames = minimum_screen_change_frames
+        self.ocr_interval_frames = ocr_interval_frames
         self._history_by_stable_id: dict[str, _KioskHistory] = {}
 
     @staticmethod
@@ -198,8 +205,65 @@ class KioskAnalyzer:
         if history.last_frame_index is not None and frame_index != history.last_frame_index + 1:
             self._reset_candidates(history)
             history.confirmed_stage_frames = 0
+            history.last_ocr_frame = None
         history.last_frame_index = frame_index
         return history
+
+    def _ocr_is_due(self, history: _KioskHistory, frame_index: int) -> bool:
+        return (
+            history.last_ocr_frame is None
+            or frame_index - history.last_ocr_frame >= self.ocr_interval_frames
+        )
+
+    def _deferred_result(
+        self,
+        detection: Detection,
+        stable_id: str,
+        history: _KioskHistory,
+        detection_confidence: float,
+    ) -> AnalysisResult:
+        lines = history.last_ocr_lines
+        observed_stage = _infer_stage(lines)
+        options = _visible_options(lines)
+        screen_is_confirmed = history.confirmed_fingerprint is not None
+        stage_is_confirmed = history.confirmed_stage is not None
+        combined_confidence = min(detection_confidence, history.last_ocr_confidence)
+        detected_object_type = normalize_object_type(detection.class_name)
+        return AnalysisResult(
+            object_type=(
+                detected_object_type if is_kiosk_object_type(detected_object_type) else "kiosk"
+            ),
+            stable_id=stable_id,
+            state=history.confirmed_stage or UNKNOWN,
+            confidence=combined_confidence if stage_is_confirmed else 0.0,
+            attributes={
+                "class_name": detection.class_name,
+                "detection_confidence": detection_confidence,
+                "visible_text": list(lines),
+                "visible_options": options,
+                "recognized_buttons": options,
+                "button_candidates": [
+                    dict(candidate) for candidate in history.last_button_candidates
+                ],
+                "button_detection_method": "keyword_allowlist_and_ocr_bbox_candidates",
+                "ocr_confidence": history.last_ocr_confidence,
+                "ocr_was_run": False,
+                "ocr_interval_frames": self.ocr_interval_frames,
+                "observed_stage": observed_stage,
+                "previous_state": None,
+                "stage_changed": False,
+                "confirmed_frames": history.confirmed_stage_frames,
+                "screen_changed": False,
+                "screen_is_confirmed": screen_is_confirmed,
+                "screen_initial_confirmation": False,
+                "screen_confidence": combined_confidence if screen_is_confirmed else 0.0,
+                "screen_candidate_frames": history.candidate_fingerprint_frames,
+                "observed_screen_fingerprint": _screen_fingerprint(lines),
+                "screen_fingerprint": history.confirmed_fingerprint,
+                "reason": "ocr_deferred",
+            },
+            is_uncertain=not stage_is_confirmed,
+        )
 
     def _read_ocr(
         self,
@@ -360,14 +424,30 @@ class KioskAnalyzer:
             math.isfinite(detection_confidence)
             and detection_confidence >= self.minimum_detection_confidence
         )
-        if detection_is_reliable:
-            lines, ocr_confidence, reason, button_candidates = self._read_ocr(crop)
-        else:
+        if not detection_is_reliable:
+            history.last_ocr_frame = None
             lines, ocr_confidence, reason, button_candidates = (
                 (),
                 0.0,
                 "low_detection_confidence",
                 [],
+            )
+            ocr_was_run = False
+        elif not self._ocr_is_due(history, detection.frame_index):
+            return self._deferred_result(
+                detection,
+                stable_id,
+                history,
+                detection_confidence,
+            )
+        else:
+            history.last_ocr_frame = detection.frame_index
+            ocr_was_run = self.ocr_engine is not None and crop is not None and crop.size > 0
+            lines, ocr_confidence, reason, button_candidates = self._read_ocr(crop)
+            history.last_ocr_lines = lines
+            history.last_ocr_confidence = ocr_confidence
+            history.last_button_candidates = tuple(
+                dict(candidate) for candidate in button_candidates
             )
         observed_stage = _infer_stage(lines)
         fingerprint = _screen_fingerprint(lines)
@@ -397,6 +477,8 @@ class KioskAnalyzer:
             "button_candidates": button_candidates,
             "button_detection_method": "keyword_allowlist_and_ocr_bbox_candidates",
             "ocr_confidence": ocr_confidence,
+            "ocr_was_run": ocr_was_run,
+            "ocr_interval_frames": self.ocr_interval_frames,
             "observed_stage": observed_stage,
             "previous_state": previous_stage,
             "stage_changed": stage_changed,

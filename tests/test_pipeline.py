@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 
@@ -364,6 +365,22 @@ def test_video_pipeline_routes_a_non_signal_detection_with_its_crop(
     assert manager_options["minimum_approach_confidence"] == 0.8
     assert manager_options["minimum_presence_confidence"] == 0.8
     assert manager_options["minimum_domain_confidence"] == 0.8
+    assert Path(summary["output_video"]).exists()
+    row = json.loads(Path(summary["output_jsonl"]).read_text().splitlines()[0])
+    assert set(row) == {
+        "frame_index",
+        "timestamp_s",
+        "inference_ms",
+        "detections",
+        "events",
+        "analysis_results",
+        "analysis_events",
+        "narrations",
+    }
+    assert row["frame_index"] == 0
+    assert row["detections"][0]["class_name"] == "bus"
+    assert row["detections"][0]["track_id"] == 7
+    assert row["analysis_results"][0]["object_type"] == "bus"
 
 
 def test_video_pipeline_resets_transient_analyzer_history(
@@ -400,7 +417,7 @@ def test_video_pipeline_resets_transient_analyzer_history(
         object_router=router,  # type: ignore[arg-type]
     )
 
-    assert router.reset_calls == ["stable-1"]
+    assert router.reset_calls == ["stable-1", None]
 
 
 def test_detection_payload_preserves_raw_id_and_adds_signal_metadata() -> None:

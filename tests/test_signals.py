@@ -241,6 +241,23 @@ def test_target_selector_keeps_previous_raw_track() -> None:
     assert selector.select_indices(second) == [0]
 
 
+def test_target_selector_reset_forgets_previous_raw_track() -> None:
+    selector = SignalTargetSelector()
+    first = [
+        detection(1, (10.0, 0.0, 30.0, 40.0), confidence=0.7),
+        detection(2, (10.0, 42.0, 30.0, 62.0), confidence=0.5),
+    ]
+    second = [
+        detection(1, (11.0, 0.0, 31.0, 40.0), confidence=0.2),
+        detection(4, (10.0, 0.0, 30.0, 42.0), confidence=0.95),
+    ]
+
+    assert selector.select_indices(first) == [0]
+    selector.reset()
+
+    assert selector.select_indices(second) == [1]
+
+
 def test_target_selector_keeps_spatially_separate_signals() -> None:
     selector = SignalTargetSelector()
     detections = [
