@@ -268,8 +268,14 @@ def summarize_pipeline_jsonl(path: str | Path) -> dict[str, dict[str, int]]:
                         continue
                     class_name = str(detection.get("class_name", "unknown")).strip() or "unknown"
                     detection_counts[class_name] += 1
-                    if isinstance(detection.get("analysis"), Mapping):
-                        analyzer_name = type(router.analyzer_for(class_name)).__name__
+                    analysis = detection.get("analysis")
+                    if isinstance(analysis, Mapping):
+                        recorded_name = analysis.get("analyzer_name")
+                        analyzer_name = (
+                            str(recorded_name).strip()
+                            if isinstance(recorded_name, str) and recorded_name.strip()
+                            else type(router.analyzer_for(class_name)).__name__
+                        )
                         analyzer_counts[analyzer_name] += 1
 
             analysis_results = frame.get("analysis_results", [])

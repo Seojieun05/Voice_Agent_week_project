@@ -236,6 +236,13 @@ class NarrationPolicy:
 
     @staticmethod
     def deduplication_key(event: AnalysisEvent, message: str) -> tuple[object, ...]:
+        """Return the user-facing semantic identity used for duplicate suppression."""
+        object_type = _normalized_object_type(event.object_type)
+        stable_id = (
+            None
+            if event.event_type == OBJECT_APPROACHING and object_type == "bus"
+            else event.stable_id
+        )
         semantic_identity = (
             event.attributes.get("screen_fingerprint")
             if event.event_type == SCREEN_CHANGED
@@ -243,8 +250,8 @@ class NarrationPolicy:
         )
         return (
             event.event_type,
-            _normalized_object_type(event.object_type),
-            event.stable_id,
+            object_type,
+            stable_id,
             _normalized_state(event.previous_state),
             _normalized_state(event.current_state),
             semantic_identity,

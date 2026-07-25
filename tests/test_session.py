@@ -4,6 +4,7 @@ from collections import deque
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from vision_agent.event_manager import OBJECT_STATE_CHANGED
 from vision_agent.pipeline import (
@@ -12,7 +13,7 @@ from vision_agent.pipeline import (
     create_vision_session,
 )
 from vision_agent.signals import SignalStateResult
-from vision_agent.types import SignalState
+from vision_agent.types import AnalysisEvent, SignalState
 
 
 class _Tensor:
@@ -112,6 +113,23 @@ class _SignalSequence:
         )
 
 
+class _RecordingNarrationScheduler:
+    def __init__(self) -> None:
+        self.enqueued_at_s: list[float] = []
+        self.popped_at_s: list[float] = []
+
+    def enqueue(self, events: object, *, now_s: float) -> None:
+        self.enqueued_at_s.append(now_s)
+
+    def pop_next(self, *, now_s: float) -> None:
+        self.popped_at_s.append(now_s)
+        return None
+
+    def reset(self) -> None:
+        self.enqueued_at_s.clear()
+        self.popped_at_s.clear()
+
+
 def _context(
     source_sequence_id: int,
     processed_index: int,
@@ -125,6 +143,45 @@ def _context(
         received_at_s=processing_started_at_s,
         processing_started_at_s=processing_started_at_s,
     )
+
+
+def test_mixed_capture_timestamps_advance_without_driving_scheduler_clock() -> None:
+    model = _SequenceModel([(5, "bus", 0.9, 1)] * 4)
+    scheduler = _RecordingNarrationScheduler()
+    session = create_vision_session(
+        PipelineConfig(
+            source="<live>",
+            device="cpu",
+            ocr_backend="none",
+            classify_signal_states=False,
+            min_seen_frames=1,
+        ),
+        live_mode=True,
+        model=model,
+        narration_scheduler=scheduler,
+    )
+    frame = np.zeros((20, 20, 3), dtype=np.uint8)
+    contexts = [
+        FrameContext(1, 0, 1_780_000_000.0, 10.0, 10.1),
+        FrameContext(2, 1, None, 10.2, 10.3),
+        FrameContext(3, 2, 3.0, 10.4, 10.5),
+        FrameContext(4, 3, 1_779_999_999.0, 10.6, 10.7),
+    ]
+
+    analyses = [session.process_frame(frame, context) for context in contexts]
+
+    expected_timestamps = [
+        1_780_000_000.0,
+        1_780_000_000.2,
+        1_780_000_000.4,
+        1_780_000_000.6,
+    ]
+    assert [analysis.timestamp_s for analysis in analyses] == pytest.approx(expected_timestamps)
+    assert [analysis.detections[0].timestamp_s for analysis in analyses] == pytest.approx(
+        expected_timestamps
+    )
+    assert scheduler.enqueued_at_s == [10.1, 10.3, 10.5, 10.7]
+    assert scheduler.popped_at_s == [10.1, 10.3, 10.5, 10.7]
 
 
 def test_source_sequence_gaps_do_not_break_processed_signal_streak() -> None:
@@ -172,6 +229,45 @@ def test_source_sequence_gaps_do_not_break_processed_signal_streak() -> None:
     assert len(changes) == 1
     assert changes[0].previous_state == "GREEN"
     assert changes[0].current_state == "RED"
+    assert messages == ["신호등 표시가 빨간색으로 바뀌었습니다."]
+
+
+def test_low_confidence_signal_streak_cannot_consume_confirmed_transition() -> None:
+    states = [SignalState.GREEN] * 3 + [SignalState.RED] * 5
+    confidences = [0.9] * 3 + [0.1, 0.1] + [0.9] * 3
+    model = _SequenceModel([(9, "traffic light", confidence, 1) for confidence in confidences])
+    session = create_vision_session(
+        PipelineConfig(
+            source="<live>",
+            device="cpu",
+            ocr_backend="none",
+            min_seen_frames=1,
+            min_signal_state_frames=3,
+        ),
+        live_mode=True,
+        model=model,
+        signal_classifier=_SignalSequence(states),
+    )
+    frame = np.zeros((20, 20, 3), dtype=np.uint8)
+    changes_by_frame: dict[int, list[AnalysisEvent]] = {}
+    messages: list[str] = []
+
+    for frame_index in range(len(states)):
+        analysis = session.process_frame(
+            frame,
+            _context(frame_index, frame_index, processing_started_at_s=frame_index * 0.1),
+        )
+        changes_by_frame[frame_index] = [
+            event for event in analysis.analysis_events if event.event_type == OBJECT_STATE_CHANGED
+        ]
+        messages.extend(analysis.narrations)
+
+    assert changes_by_frame[5] == []
+    assert [index for index, changes in changes_by_frame.items() if changes] == [7]
+    change = changes_by_frame[7][0]
+    assert change.previous_state == "GREEN"
+    assert change.current_state == "RED"
+    assert change.is_uncertain is False
     assert messages == ["신호등 표시가 빨간색으로 바뀌었습니다."]
 
 
@@ -243,6 +339,28 @@ def test_live_tracker_defaults_to_botsort_and_allows_bytetrack_override() -> Non
 
     assert default_model.track_calls[0]["tracker"] == "botsort.yaml"
     assert override_model.track_calls[0]["tracker"] == "bytetrack.yaml"
+
+
+def test_mp4_scheduler_keeps_reproducible_source_timestamps() -> None:
+    model = _SequenceModel([(5, "bus", 0.9, 1)] * 2)
+    scheduler = _RecordingNarrationScheduler()
+    session = create_vision_session(
+        PipelineConfig(
+            source="video.mp4",
+            device="cpu",
+            ocr_backend="none",
+            classify_signal_states=False,
+        ),
+        model=model,
+        narration_scheduler=scheduler,
+    )
+    frame = np.zeros((20, 20, 3), dtype=np.uint8)
+
+    session.process_frame(frame, _context(0, 0, processing_started_at_s=10.0))
+    session.process_frame(frame, _context(1, 1, processing_started_at_s=20.0))
+
+    assert scheduler.enqueued_at_s == [0.0, 0.1]
+    assert scheduler.popped_at_s == [0.0, 0.1]
 
 
 def test_mp4_session_keeps_bytetrack_default() -> None:

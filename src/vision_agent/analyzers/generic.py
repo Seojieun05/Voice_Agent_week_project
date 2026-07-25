@@ -184,10 +184,7 @@ class GenericVisionAnalyzer:
                 reason="generic_vision_disabled",
                 is_uncertain=True,
             )
-        if (
-            self.allowed_object_types is not None
-            and object_type not in self.allowed_object_types
-        ):
+        if self.allowed_object_types is not None and object_type not in self.allowed_object_types:
             return self._result(
                 detection,
                 stable_id,

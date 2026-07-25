@@ -176,8 +176,24 @@ def test_timestamp_never_moves_backwards() -> None:
         timestamps.append(timestamp_s)
         previous_timestamp_s = timestamp_s
 
-    assert timestamps == pytest.approx([0.0, 0.1, 0.1, 0.3])
+    assert timestamps == pytest.approx([0.0, 0.1, 0.2, 0.3])
     assert all(current >= previous for previous, current in zip(timestamps, timestamps[1:]))
+
+
+def test_timestamp_uses_frame_rate_when_positive_capture_position_freezes() -> None:
+    capture = FakeCapture(100.0)
+
+    timestamp_s = _calculate_frame_timestamp_s(capture, 3, 10.0, 0.1)
+
+    assert timestamp_s == pytest.approx(0.3)
+
+
+def test_timestamp_advances_from_large_frozen_capture_position() -> None:
+    capture = FakeCapture(10_000.0)
+
+    timestamp_s = _calculate_frame_timestamp_s(capture, 1, 10.0, 10.0)
+
+    assert timestamp_s == pytest.approx(10.1)
 
 
 def test_performance_summary_uses_last_timestamp_and_has_required_fields() -> None:

@@ -106,7 +106,20 @@ def test_object_classes_route_to_their_injected_analyzers(
     result = router.route_detection(detection(class_name), stable_id="stable-4")
 
     assert result.object_type == expected
+    assert result.analyzer_name == "_RecordingAnalyzer"
+    assert result.to_dict()["analyzer_name"] == "_RecordingAnalyzer"
     assert len(analyzers[expected].calls) == 1
+
+
+def test_unrouted_analysis_result_omits_empty_analyzer_provenance() -> None:
+    result = AnalysisResult(
+        object_type="bus",
+        stable_id="stable-1",
+        state=None,
+        confidence=0.0,
+    )
+
+    assert "analyzer_name" not in result.to_dict()
 
 
 def test_router_forwards_stable_id_crop_and_precomputed_signal_result(

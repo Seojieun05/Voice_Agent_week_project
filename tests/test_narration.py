@@ -371,6 +371,31 @@ def test_scheduler_deduplicates_queued_and_recently_emitted_semantic_event() -> 
     assert scheduler.pop_next(now_s=5.0) is not None
 
 
+def test_scheduler_deduplicates_bus_approach_across_reconnected_stable_ids() -> None:
+    scheduler = NarrationScheduler(duplicate_cooldown_s=5.0)
+    first = event(
+        OBJECT_APPROACHING,
+        object_type="bus",
+        stable_id="stable-1",
+        timestamp_s=1.0,
+    )
+    reconnected = event(
+        OBJECT_APPROACHING,
+        object_type="bus",
+        stable_id="stable-2",
+        timestamp_s=3.0,
+    )
+
+    scheduler.enqueue(first, now_s=1.0)
+    assert scheduler.pop_next(now_s=1.0) is not None
+
+    scheduler.enqueue(reconnected, now_s=3.0)
+    assert scheduler.pop_next(now_s=3.0) is None
+
+    scheduler.enqueue(reconnected, now_s=6.0)
+    assert scheduler.pop_next(now_s=6.0) is not None
+
+
 def test_scheduler_capacity_preserves_higher_priority_candidate() -> None:
     scheduler = NarrationScheduler(max_queue_size=1)
     sign = event(

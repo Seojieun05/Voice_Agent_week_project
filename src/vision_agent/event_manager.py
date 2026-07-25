@@ -93,6 +93,7 @@ class SceneEventManager:
         self._presence_states: dict[str, str] = {}
         self._domain_values: dict[tuple[str, str], object] = {}
         self._emitted_signatures: set[tuple[object, ...]] = set()
+        self._pending_signal_transitions: dict[str, SceneEvent] = {}
 
     @staticmethod
     def _freeze(value: object) -> object:
@@ -222,6 +223,7 @@ class SceneEventManager:
     def _forget_object(self, stable_id: str, *, remove_deduplication: bool = False) -> None:
         self._active_results.pop(stable_id, None)
         self._known_states.pop(stable_id, None)
+        self._pending_signal_transitions.pop(stable_id, None)
         self._domain_values = {
             key: value for key, value in self._domain_values.items() if key[0] != stable_id
         }
@@ -241,6 +243,7 @@ class SceneEventManager:
             self._presence_states.clear()
             self._domain_values.clear()
             self._emitted_signatures.clear()
+            self._pending_signal_transitions.clear()
             return
         self._forget_object(
             _normalize_stable_id(stable_id),
@@ -388,6 +391,8 @@ class SceneEventManager:
         scene_event: SceneEvent,
         result_by_id: dict[str, AnalysisResult],
         events: list[AnalysisEvent],
+        *,
+        confirmed_at_s: float | None = None,
     ) -> None:
         event_type = _LEGACY_EVENT_TYPES.get(scene_event.event_type.lower())
         if event_type is None:
@@ -440,18 +445,34 @@ class SceneEventManager:
         current_state = _normalize_state(scene_event.current_state)
         if previous_state is None or current_state is None or previous_state == current_state:
             return
+        if object_type in SIGNAL_OBJECT_TYPES:
+            current_result = result_by_id.get(stable_id)
+            if current_result is None or current_result.is_uncertain:
+                # Retain the legacy transition evidence, but timestamp it only when
+                # the analyzer independently confirms the destination state.
+                self._pending_signal_transitions[stable_id] = scene_event
+                return
+            confirmed_state = _normalize_state(current_result.state)
+            if confirmed_state != current_state:
+                # A reliable contradictory result invalidates the pending event.
+                self._pending_signal_transitions.pop(stable_id, None)
+                return
         if not self._state_confidence_is_sufficient(object_type, confidence):
             return
 
-        # The existing event engine is authoritative for pipeline timing. Accept
-        # its explicit previous state even when this manager has no prior frame.
+        # Immediate legacy events retain their source timestamp. A transition
+        # held for analyzer confirmation uses the confirmation update timestamp.
+        transition_timestamp_s = (
+            scene_event.timestamp_s if confirmed_at_s is None else confirmed_at_s
+        )
         if self._known_states.get(stable_id) == current_state:
+            self._pending_signal_transitions.pop(stable_id, None)
             return
         translated = AnalysisEvent(
             event_type=OBJECT_STATE_CHANGED,
             object_type=object_type,
             stable_id=stable_id,
-            timestamp_s=scene_event.timestamp_s,
+            timestamp_s=transition_timestamp_s,
             previous_state=previous_state,
             current_state=current_state,
             confidence=confidence,
@@ -460,6 +481,7 @@ class SceneEventManager:
         )
         if self._append_once(events, translated):
             self._known_states[stable_id] = current_state
+        self._pending_signal_transitions.pop(stable_id, None)
 
     def update(
         self,
@@ -473,7 +495,17 @@ class SceneEventManager:
         result_by_id = {_normalize_stable_id(result.stable_id): result for result in results}
 
         # Legacy events go first because their timestamps and explicit transition
-        # states are canonical in the current YOLO pipeline.
+        # states are canonical in the current YOLO pipeline. A signal transition
+        # held from an uncertain frame is retried against the current analyzer
+        # result, including when automatic state derivation is disabled.
+        pending_scene_events = tuple(self._pending_signal_transitions.values())
+        for scene_event in pending_scene_events:
+            self._apply_legacy_event(
+                scene_event,
+                result_by_id,
+                events,
+                confirmed_at_s=timestamp_s,
+            )
         for scene_event in scene_events:
             self._apply_legacy_event(scene_event, result_by_id, events)
 

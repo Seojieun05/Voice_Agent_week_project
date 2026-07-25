@@ -641,6 +641,30 @@ def _stable_ids_by_family(rows: Sequence[Mapping[str, Any]]) -> dict[str, set[st
     return result
 
 
+def _stable_ids_by_family_and_frame(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, dict[int, set[str]]]:
+    """Return stable IDs on each frame without double-counting nested analyses."""
+    result: dict[str, dict[int, set[str]]] = defaultdict(lambda: defaultdict(set))
+    for row_index, row in enumerate(rows):
+        frame_index = _frame_index(row, row_index)
+        detections = row.get("detections", [])
+        if isinstance(detections, list):
+            for detection in detections:
+                if not isinstance(detection, Mapping):
+                    continue
+                stable_id = _canonical_stable_id(detection.get("stable_object_key"))
+                if stable_id:
+                    family = _object_family(detection.get("class_name", ""))
+                    result[family][frame_index].add(stable_id)
+        for analysis in _frame_analyses(row):
+            stable_id = _canonical_stable_id(analysis.get("stable_id"))
+            if stable_id:
+                family = _object_family(analysis.get("object_type", ""))
+                result[family][frame_index].add(stable_id)
+    return result
+
+
 def _metric(
     metrics: dict[str, Any],
     reasons: dict[str, str],
@@ -751,7 +775,8 @@ def _performance_metrics(
     else:
         routed = sorted(
             {
-                _analyzer_name(analysis.get("object_type", ""))
+                str(analysis.get("analyzer_name") or "").strip()
+                or _analyzer_name(analysis.get("object_type", ""))
                 for analysis in analyses
                 if str(analysis.get("object_type", "")).strip()
             }
@@ -775,19 +800,45 @@ def _fragmentation_metric(
     objects: Sequence[Mapping[str, Any]],
     families: set[str],
 ) -> int | None:
-    expected = Counter(
-        _object_family(obj.get("object_type", ""))
+    visible_objects = [
+        obj
         for obj in objects
-        if _intervals(obj, "visible_frame_ranges", "visible_ranges")
-    )
-    if not expected:
+        if _object_family(obj.get("object_type", "")) in families
+        and _intervals(obj, "visible_frame_ranges", "visible_ranges")
+    ]
+    if not visible_objects:
         return None
-    predicted = _stable_ids_by_family(rows)
-    return sum(
-        max(0, len(predicted.get(family, set())) - object_count)
-        for family, object_count in expected.items()
-        if family in families
-    )
+    visible_families = {_object_family(obj.get("object_type", "")) for obj in visible_objects}
+    if any(
+        _has_overlapping_visible_objects(visible_objects, family) for family in visible_families
+    ):
+        return None
+
+    predicted = _stable_ids_by_family_and_frame(rows)
+    fragmentation = 0
+    for obj in visible_objects:
+        family = _object_family(obj.get("object_type", ""))
+        visible_frames: set[int] = set()
+        for interval in _intervals(obj, "visible_frame_ranges", "visible_ranges"):
+            bounds = _interval_bounds(interval)
+            if bounds is not None:
+                visible_frames.update(range(bounds[0], bounds[1] + 1))
+        associated_ids = {
+            stable_id
+            for frame_index in visible_frames
+            for stable_id in predicted.get(family, {}).get(frame_index, set())
+        }
+        fragmentation += max(0, len(associated_ids) - 1)
+    return fragmentation
+
+
+def _fragmentation_unavailable_reason(
+    objects: Sequence[Mapping[str, Any]],
+    families: set[str],
+) -> str:
+    if any(_has_overlapping_visible_objects(objects, family) for family in families):
+        return "multiple_objects_require_prediction_association"
+    return "visible_object_ground_truth_not_available"
 
 
 def _fps(annotation: Mapping[str, Any] | None, run_row: Mapping[str, Any]) -> float | None:
@@ -1117,13 +1168,12 @@ def _bus_metrics(
         "bus_visible_frame_ground_truth_not_available",
     )
     bus_objects = [obj for obj in objects if _object_family(obj.get("object_type", "")) == "bus"]
-    stable_ids = _stable_ids_by_family(rows).get("bus", set())
     _metric(
         metrics,
         reasons,
         "bus_track_fragmentation_count",
-        max(0, len(stable_ids) - len(bus_objects)) if bus_objects else None,
-        "bus_object_ground_truth_not_available",
+        _fragmentation_metric(rows, bus_objects, {"bus"}),
+        _fragmentation_unavailable_reason(bus_objects, {"bus"}),
     )
 
     motion_labels = _labeled_frames(
@@ -1500,6 +1550,29 @@ def _narration_constraints(annotation: Mapping[str, Any] | None) -> dict[str, An
     return dict(raw) if isinstance(raw, Mapping) else {}
 
 
+def _bus_approach_narration_count(rows: Sequence[Mapping[str, Any]]) -> int:
+    return sum(
+        message == "버스가 접근하고 있습니다." or message.endswith("버스가 들어오고 있습니다.")
+        for message in _narrations(rows)
+    )
+
+
+def _route_record_has_stable_ocr_evidence(record: Mapping[str, Any]) -> bool:
+    attributes = record.get("attributes", {})
+    if not isinstance(attributes, Mapping):
+        return False
+    confirmed_frames = _integer(attributes.get("ocr_confirmed_frames"))
+    route_confidence = _finite_number(attributes.get("route_confidence"))
+    return (
+        record.get("is_uncertain") is not True
+        and attributes.get("route_is_current") is True
+        and confirmed_frames is not None
+        and confirmed_frames >= 3
+        and route_confidence is not None
+        and route_confidence >= 0.75
+    )
+
+
 def _safety_constraints(
     video_id: str,
     rows: Sequence[Mapping[str, Any]],
@@ -1542,13 +1615,15 @@ def _safety_constraints(
         add("no_confident_red_or_green_transition", red_green, 0)
 
     if "bus_london_pulls_in" in normalized_id:
-        approaches = sum(
-            str(event.get("event_type", "")).upper() == "OBJECT_APPROACHING"
-            and _object_family(event.get("object_type", "")) == "bus"
-            for event in all_events
+        add(
+            "at_most_one_bus_approach_narration",
+            _bus_approach_narration_count(rows),
+            1,
         )
-        add("at_most_one_bus_approach_event", approaches, 1)
-        add("do_not_confirm_unreadable_route_number", len(_route_records(rows)), 0)
+        unsupported_routes = sum(
+            not _route_record_has_stable_ocr_evidence(record) for record in _route_records(rows)
+        )
+        add("route_number_requires_stable_ocr_evidence", unsupported_routes, 0)
 
     if "bus_waiting_multiple_arrivals" in normalized_id:
         approach_events = [
@@ -1564,7 +1639,23 @@ def _safety_constraints(
         ]
         duplicate_approaches = _duplicate_count(approach_stable_ids)
         maximum = _integer(_narration_constraints(annotation).get("maximum_duplicate_events"))
-        add("duplicate_bus_approach_event_limit", duplicate_approaches, maximum or 0)
+        maximum = maximum or 0
+        if duplicate_approaches <= maximum or _review_status(annotation) == "reviewed":
+            add("duplicate_bus_approach_event_limit", duplicate_approaches, maximum)
+        else:
+            constraints.append(
+                {
+                    "name": "duplicate_bus_approach_event_limit",
+                    "status": "NOT_EVALUATED",
+                    "observed": duplicate_approaches,
+                    "maximum": maximum,
+                    "reason": "approach_episodes_require_manual_review",
+                }
+            )
+        unsupported_routes = sum(
+            not _route_record_has_stable_ocr_evidence(record) for record in _route_records(rows)
+        )
+        add("route_number_requires_stable_ocr_evidence", unsupported_routes, 0)
         stable_ids = sorted(_stable_ids_by_family(rows).get("bus", set()))
         constraints.append(
             {
@@ -1638,7 +1729,8 @@ def _qualitative_summary(
         "prediction_available": prediction_path is not None,
         "routed_analyzer_types": sorted(
             {
-                _normalize_token(analysis.get("object_type", ""))
+                str(analysis.get("analyzer_name") or "").strip()
+                or _analyzer_name(analysis.get("object_type", ""))
                 for analysis in analyses
                 if str(analysis.get("object_type", "")).strip()
             }
@@ -1692,7 +1784,7 @@ def evaluate_video(
             reasons,
             "stable_id_fragmentation_count",
             fragmentation,
-            "visible_object_ground_truth_not_available",
+            _fragmentation_unavailable_reason(objects, families),
         )
         video_fps = _fps(annotation, run_row)
         if "signal" in families:
@@ -1758,7 +1850,7 @@ def evaluate_video(
         "safety_constraints": safety,
         "safety_failure_count": sum(item.get("status") == "FAIL" for item in safety),
         "limitations": [
-            "stable ID fragmentation is estimated by object-family counts; no box-level GT association is available",
+            "stable ID fragmentation uses non-overlapping visible-frame ranges; overlapping same-family objects require box-level GT association",
             "multiple ground-truth buses cannot be associated with predicted routes without track-level GT links",
             "only non-ambiguous, human-reviewed intervals and transitions are scored",
         ],
@@ -1910,7 +2002,7 @@ def evaluate_public_baseline(
         "qualitative_only_video_count": sum(
             row["quantitative_evaluation"] is not True for row in summary_rows
         ),
-        "failed_video_count": sum(row["status"] == "evaluation_failed" for row in summary_rows),
+        "failed_video_count": sum(row["status"] != "ok" for row in summary_rows),
         "videos": summary_rows,
     }
     output_dir.mkdir(parents=True, exist_ok=True)

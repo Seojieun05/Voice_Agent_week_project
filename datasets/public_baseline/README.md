@@ -71,9 +71,10 @@ crop, and its inference interval. It is never used for traffic lights or buses.
 
 OCR is shared by bus, kiosk, and text analyzers. It runs only with `--ocr-backend rapidocr`, a
 loadable RapidOCR engine/model, a valid object crop, analyzer-specific confidence/stability
-gates, and the analyzer's OCR interval. `--ocr-backend none` explicitly disables it. A language
-other than the bundled `default` needs a local recognition model unless download is explicitly
-allowed.
+gates, and the analyzer's OCR interval. `--ocr-backend none` explicitly disables it. Without
+`--allow-ocr-download`, detector, classifier, and recognizer must all resolve to local files; any
+additional RapidOCR downloader call is blocked. A language-specific local recognizer can be supplied
+with `--ocr-model-path`.
 
 For COCO class 9, `TrafficLightAnalyzer` records `attributes.signal_type = "UNKNOWN"` and
 `signal_type_is_uncertain = true` because that label does not distinguish pedestrian from
@@ -143,7 +144,6 @@ Generated `review/` content is ignored by the dataset-local `.gitignore`. The re
 `.gitignore` already excludes `samples/*`, so original and transcoded videos cannot be added by
 normal Git workflows.
 
-
 ## Run and evaluate the baseline
 
 Run all videos with the fixed category-level class policy, then evaluate the preserved JSONL:
@@ -164,4 +164,8 @@ The batch writes root `run_summary.json`/`.csv`, per-video settings and pipeline
 original JSONL, and annotated MP4. Evaluation writes `summary.json`/`.csv` plus JSON and Markdown
 reports under `evaluation/reports/`. Only annotations explicitly marked `reviewed` contribute
 ground-truth metrics; `needs_manual_review` videos remain qualitative and unavailable metrics are
-recorded as `null` with a reason.
+recorded as `null` with a reason. Routed analyzer reports prefer the recorded `analyzer_name` and
+fall back to object-type inference only for legacy JSONL. Stable-ID fragmentation is calculated only
+inside non-overlapping reviewed visible ranges; overlapping same-family objects require box-level
+association and stay `null`. Safety checks that need human approach-episode association remain
+`NOT_EVALUATED`, while route-number checks validate the recorded consecutive OCR evidence.

@@ -466,6 +466,8 @@ def test_summary_json_csv_fields_match_and_cli_writes_video_reports(
     assert set(summary["videos"][0]) == set(csv_rows[0])
     assert Path(summary["videos"][0]["report_json"]).is_file()
     assert Path(summary["videos"][0]["report_markdown"]).is_file()
+    report = _report_for(summary, video_id)
+    assert report["qualitative"]["routed_analyzer_types"] == ["GenericVisionAnalyzer"]
 
 
 def _report_for(summary: dict[str, object], video_id: str) -> dict[str, object]:
@@ -527,6 +529,7 @@ def test_missing_or_failed_prediction_has_null_metrics_and_unknown_safety(
     summary = evaluate_public_baseline(manifest, predictions, tmp_path / "evaluation")
 
     assert summary["quantitatively_evaluated_video_count"] == 0
+    assert summary["failed_video_count"] == 2
     for video_id in (missing_id, failed_id):
         report = _report_for(summary, video_id)
         assert report["quantitative_evaluation"] is False
@@ -791,6 +794,86 @@ def test_multiple_bus_routes_require_track_level_ground_truth_association(
     assert report["metrics"]["duplicate_bus_approach_event_count"] == 1
 
 
+def test_london_bus_safety_uses_narration_and_stable_ocr_evidence(tmp_path: Path) -> None:
+    video_id = "bus_london_pulls_in"
+    manifest = _manifest(tmp_path, [{"id": video_id, "category": "bus"}])
+    predictions = tmp_path / "predictions"
+    _run_summary(predictions, [video_id])
+    approaches = [
+        {
+            "event_type": "OBJECT_APPROACHING",
+            "object_type": "bus",
+            "stable_id": f"stable-{index}",
+        }
+        for index in range(3)
+    ]
+    route = {
+        "event_type": "TEXT_CONFIRMED",
+        "object_type": "bus",
+        "stable_id": "stable-1",
+        "confidence": 0.9,
+        "attributes": {
+            "route_number": "D1",
+            "route_confidence": 0.9,
+            "route_is_current": True,
+            "ocr_confirmed_frames": 3,
+        },
+        "is_uncertain": False,
+    }
+    _write_jsonl(
+        predictions / video_id / f"{video_id}_detections.jsonl",
+        [
+            _row(
+                0,
+                [_analysis("bus", "stable-1", "APPROACHING")],
+                events=[*approaches, route],
+                narrations=["버스가 접근하고 있습니다.", "D1번 버스입니다."],
+            )
+        ],
+    )
+
+    summary = evaluate_public_baseline(manifest, predictions, tmp_path / "evaluation")
+    report = _report_for(summary, video_id)
+    safety = {item["name"]: item for item in report["safety_constraints"]}
+
+    assert safety["at_most_one_bus_approach_narration"]["status"] == "PASS"
+    assert safety["at_most_one_bus_approach_narration"]["observed"] == 1
+    assert safety["route_number_requires_stable_ocr_evidence"]["status"] == "PASS"
+    assert report["safety_failure_count"] == 0
+
+
+def test_unreviewed_bus_approach_episodes_are_observed_not_failed(tmp_path: Path) -> None:
+    video_id = "bus_waiting_multiple_arrivals"
+    manifest = _manifest(tmp_path, [{"id": video_id, "category": "bus"}])
+    predictions = tmp_path / "predictions"
+    _run_summary(predictions, [video_id])
+    approach = {
+        "event_type": "OBJECT_APPROACHING",
+        "object_type": "bus",
+        "stable_id": "stable-1",
+    }
+    _write_jsonl(
+        predictions / video_id / f"{video_id}_detections.jsonl",
+        [
+            _row(0, [_analysis("bus", "stable-1", "APPROACHING")], events=[approach]),
+            _row(1, [_analysis("bus", "stable-1", "APPROACHING")], events=[approach]),
+        ],
+    )
+
+    summary = evaluate_public_baseline(manifest, predictions, tmp_path / "evaluation")
+    report = _report_for(summary, video_id)
+    constraint = next(
+        item
+        for item in report["safety_constraints"]
+        if item["name"] == "duplicate_bus_approach_event_limit"
+    )
+
+    assert constraint["status"] == "NOT_EVALUATED"
+    assert constraint["observed"] == 1
+    assert constraint["reason"] == "approach_episodes_require_manual_review"
+    assert report["safety_failure_count"] == 0
+
+
 def test_bus_waiting_allows_same_narration_for_different_stable_ids(tmp_path: Path) -> None:
     video_id = "bus_waiting_multiple_arrivals"
     manifest = _manifest(tmp_path, [{"id": video_id, "category": "bus"}])
@@ -978,7 +1061,58 @@ def test_overlapping_signal_objects_require_prediction_association(
             report["metric_reasons"][metric_name]
             == "multiple_objects_require_prediction_association"
         )
+    assert report["metrics"]["stable_id_fragmentation_count"] is None
+    assert (
+        report["metric_reasons"]["stable_id_fragmentation_count"]
+        == "multiple_objects_require_prediction_association"
+    )
     assert report["metrics"]["duplicate_transition_count"] == 1
+
+
+def test_fragmentation_uses_visible_ranges_and_ignores_tracks_outside_ground_truth(
+    tmp_path: Path,
+) -> None:
+    video_id = "fragmented_bus"
+    manifest = _manifest(
+        tmp_path,
+        [
+            {
+                "id": video_id,
+                "category": "bus",
+                "annotation_path": f"annotations/{video_id}.json",
+            }
+        ],
+    )
+    _write_json(
+        manifest.parent / "annotations" / f"{video_id}.json",
+        {
+            "video_id": video_id,
+            "review_status": "reviewed",
+            "objects": [
+                {
+                    "ground_truth_id": "bus-1",
+                    "object_type": "bus",
+                    "visible_frame_ranges": [{"start_frame": 2, "end_frame": 3}],
+                }
+            ],
+        },
+    )
+    predictions = tmp_path / "predictions"
+    _run_summary(predictions, [video_id])
+    _write_jsonl(
+        predictions / video_id / f"{video_id}_detections.jsonl",
+        [
+            _row(0, [_analysis("bus", "false-positive", "UNKNOWN", uncertain=True)]),
+            _row(2, [_analysis("bus", "stable-1", "STOPPED")]),
+            _row(3, [_analysis("bus", "stable-2", "STOPPED")]),
+        ],
+    )
+
+    summary = evaluate_public_baseline(manifest, predictions, tmp_path / "evaluation")
+    metrics = _report_for(summary, video_id)["metrics"]
+
+    assert metrics["stable_id_fragmentation_count"] == 1
+    assert metrics["bus_track_fragmentation_count"] == 1
 
 
 def test_legacy_uncertain_signal_detection_falls_back_to_unknown(

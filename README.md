@@ -20,14 +20,14 @@
 - 키오스크 OCR 기반 단계·버튼 인식과 화면 변경 확인
 - 표지판·전광판·화면 OCR의 크기·신뢰도·연속 프레임 확인
 - 알 수 없는 객체 crop만 처리하는 선택적 로컬 Generic VLM fallback
-- 공통 `AnalysisResult`와 분석 이벤트 JSON 직렬화
+- 실제 호출 Analyzer 이름을 포함한 공통 `AnalysisResult`와 분석 이벤트 JSON 직렬화
 - 이벤트 우선순위·신뢰도·중복 억제를 적용하는 정형 Narration Policy
 - TTL·우선순위·최대 크기를 가진 `NarrationScheduler` 발화 큐
 - MP4와 서버가 함께 쓰는 프레임 단위 `VisionSession`
 - FastAPI `/health` 및 `/ws/vision` 실시간 JPEG 수신 서버
 - 선택적 신호등 crop 저장
 - 바운딩박스가 표시된 결과 영상과 프레임별 JSONL 저장
-- 영상 PTS 기반 단조 비감소 타임스탬프와 처리 성능 요약
+- 정지·역행 PTS를 프레임 간격으로 복구하는 단조 타임스탬프와 처리 성능 요약
 - CUDA 사용 가능 여부에 따른 GPU 0/CPU 자동 선택
 
 > HSV 상태 분류기는 `visiontest2.mp4`와 `visiontest3.mp4`에서 검증한 실험 기능입니다.
@@ -74,12 +74,16 @@ VisionSession → YOLO26 탐지 → tracker/stable ID → ObjectRouter
 | `ticket_machine`, `bus_route_display`, `sign`, `display`, `screen`, `monitor` | `TextObjectAnalyzer` | 문자만 확정하며 주문 단계나 버스 번호 연계를 추측하지 않음 |
 | `reverse_vending_machine`, `unknown_panel` | `GenericVisionAnalyzer` | 주문 키오스크 단계 분석 금지, VLM allowlist 별도 적용 |
 
+`ObjectRouter`를 거친 결과에는 실제 호출한 Analyzer 클래스명이 `analyzer_name`으로 기록됩니다.
+공개 baseline 평가는 이 provenance를 우선 사용하며, 이전 JSONL에는 객체 종류 기반 fallback을
+적용합니다.
+
 `TrafficLightAnalyzer`는 stable ID마다 연속 관측 이력을 따로 관리합니다. 파이프라인에서
 이미 계산한 HSV 결과를 재사용하므로 같은 crop을 중복 분류하지 않으며, 세 프레임이
 확정되기 전에는 `is_uncertain=true`로 반환합니다. 탐지 프레임이 끊기면 전환 후보의
-연속 횟수도 초기화됩니다. 기존 `StableObjectEventEngine` 이벤트는 원래 시각 그대로 먼저
-변환되고, `SceneEventManager`가 Analyzer의 확정 상태 전환을 보완한 뒤 같은 전환은 한
-번만 남깁니다.
+연속 횟수도 초기화됩니다. 기존 `StableObjectEventEngine`의 신호 전환은 Analyzer가 같은
+목적 상태를 확정했을 때만 변환됩니다. 아직 불확실하면 보류해 확정 update 시각으로 기록하고,
+확정 상태가 서로 모순되면 폐기합니다. `SceneEventManager`의 보완 전환과 겹쳐도 한 번만 남깁니다.
 `traffic_light`는 COCO 호환을 위해 subtype을 `UNKNOWN`으로 유지하고,
 `pedestrian_signal`과 `vehicle_traffic_light`는 detector 클래스 근거를 각각
 `PEDESTRIAN`, `VEHICLE`로 보존합니다.
@@ -90,7 +94,8 @@ VisionSession → YOLO26 탐지 → tracker/stable ID → ObjectRouter
 번호 OCR은 접근 또는 정차가 확정된 버스에만 기본 7프레임 간격으로 실행합니다. 한 프레임에
 숫자가 여러 개면 최고 신뢰 후보가 차점 후보보다 충분히 우세할 때만 투표하며, 실제로 새로
 실행한 OCR에서 같은 번호가 3회 확인돼야 확정합니다. 현재 관측이 끊기면 과거 번호는 진단
-이력으로만 남고 접근 발화에 다시 사용하지 않습니다. `KioskAnalyzer`는 OCR 문구와 버튼을
+이력으로만 남고 접근 발화에 다시 사용하지 않습니다. 동일한 버스 접근 문장은 tracker ID와 무관하게 기본 5초 동안 중복 발화하지 않으며
+구조화 이벤트는 보존합니다. `KioskAnalyzer`는 OCR 문구와 버튼을
 이용해 주문 방식 선택·결제·확인 단계를 판정하고, 화면 지문이 연속 확인됐을 때만 변경
 이벤트를 만듭니다. `TextObjectAnalyzer`는 충분히 큰 crop에서 신뢰도 기준을 통과한 문자가
 충분히 큰 OCR bbox를 가지며 기본 3프레임 일치할 때만 확정합니다. 비슷해 보여도 숫자가
@@ -208,7 +213,10 @@ curl http://127.0.0.1:8000/health
 응답하며 해당 연결을 가능한 한 유지합니다. 처리 중인 프레임 하나 외에 대기 큐는 크기
 1입니다. 처리 중 새 프레임이 여러 개 오면 오래된 대기 프레임을 버리고 최신 프레임만
 남기며, `dropped_frames`는 이 교체 횟수의 누적값입니다. 원본 `sequence_id`가 건너뛰어도
-Analyzer에는 서버가 실제 처리한 연속 `processed_index`가 전달됩니다.
+Analyzer에는 서버가 실제 처리한 연속 `processed_index`가 전달됩니다. live 발화 TTL과 중복
+제거는 `processing_started_at_s` 단조 시계를 사용해 클라이언트 epoch와 서버 monotonic 시각을
+섞지 않습니다. 응답의 frame/event 시각은 유효한 `captured_at_ms`를 우선하되 값이 없거나
+정지·역행하면 실제 처리 간격만큼 단조 증가시킵니다. MP4는 재현 가능한 원본 PTS를 유지합니다.
 
 샘플 MP4 클라이언트는 다음처럼 실행합니다.
 
@@ -232,7 +240,6 @@ python scripts/stream_video_client.py \
 `VISION_SERVER_NARRATE_BUS_APPROACH=true`로 발화를 활성화할 수 있습니다. Kiosk/Text OCR은
 live 기본 5 처리 프레임 간격으로 제한됩니다.
 
-
 ### 선택적 OCR 설치
 
 버스 번호, 키오스크, 표지판·화면 OCR에는 RapidOCR와 ONNX Runtime이 필요합니다.
@@ -242,13 +249,16 @@ pip install -e '.[ocr]'
 ```
 
 기본 `default` 인식 모델은 패키지에 포함된 가중치를 사용하므로 숫자·라틴 문자는 오프라인에서도
-동작하며, 네트워크에서 OCR 모델을 임의로 내려받지 않습니다. 한국어 PP-OCRv5 인식 모델 파일을
-준비했다면 다음처럼 지정합니다.
+동작합니다. `--allow-ocr-download`를 지정하지 않으면 detector, classifier, recognizer 모델이 모두
+실제 로컬 파일인지 RapidOCR 생성 전에 확인합니다. RapidOCR 내부의 추가 다운로드 시도도 네트워크
+요청 전에 차단하며, 필요한 로컬 리소스가 없으면 해당 OCR을 불확실 결과로 처리합니다. 한국어
+PP-OCRv5 인식 모델 파일을 준비했다면 다음처럼 지정합니다.
 
 ```bash
 python scripts/detect_video.py \
   --source samples/bus.mp4 \
   --classes 5 \
+  --ocr-language korean \
   --ocr-model-path /models/korean-rec.onnx
 ```
 
@@ -316,7 +326,11 @@ python scripts/evaluate_public_baseline.py \
 클래스를 동일 baseline 설정으로 사용합니다. 영상별 오류는 격리되고 실행 설정·Git SHA·실제
 Analyzer 호출 수와 한계가 `run_summary.json`/`.csv`에 기록됩니다. 평가는 사람이
 `reviewed`로 표시한 annotation만 정량화하며, 미검수 영상은 운영 관측과 안전 constraint를 담은
-정성 report만 생성합니다. 산출 불가능한 지표는 `0` 대신 `null`과 사유로 남습니다.
+정성 report만 생성합니다. 산출 불가능한 지표는 `0` 대신 `null`과 사유로 남습니다. stable ID
+fragmentation은 검수된 객체의 서로 겹치지 않는 visible frame 범위 안에서만 계산하며, 같은
+family 객체가 겹치면 box-level 연결 GT가 없어 `null`입니다. 미검수 다중 버스의 재접근 episode는
+FAIL로 단정하지 않고 관찰값으로 남기고, 노선 안전 constraint는 확정 OCR의 연속 횟수와 신뢰
+근거를 검사합니다.
 
 ## 2. 신호등 영상 실행
 
@@ -423,6 +437,7 @@ JSONL 한 줄은 한 프레임의 결과입니다. `track_id`는 YOLO/ByteTrack�
       "signal_yellow_ratio": 0.0,
       "analysis": {
         "object_type": "traffic_light",
+        "analyzer_name": "TrafficLightAnalyzer",
         "stable_id": "stable-1",
         "state": "RED",
         "confidence": 0.391243,
@@ -449,6 +464,7 @@ JSONL 한 줄은 한 프레임의 결과입니다. `track_id`는 YOLO/ByteTrack�
   "analysis_results": [
     {
       "object_type": "traffic_light",
+      "analyzer_name": "TrafficLightAnalyzer",
       "stable_id": "stable-1",
       "state": "RED",
       "confidence": 0.391243,
@@ -533,6 +549,8 @@ JSONL 한 줄은 한 프레임의 결과입니다. `track_id`는 YOLO/ByteTrack�
 pip install -e '.[dev,server]'
 pytest -q
 ruff check .
+ruff format --check src scripts tests
+python -m pip check
 ```
 
 단위 테스트는 모델 다운로드나 네트워크 연결을 사용하지 않습니다.

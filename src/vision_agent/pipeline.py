@@ -279,6 +279,17 @@ def _calculate_frame_timestamp_s(
         if math.isfinite(previous_timestamp_s) and previous_timestamp_s >= 0
         else 0.0
     )
+    if (
+        frame_index > 0
+        and position_is_available
+        and candidate_timestamp_s <= safe_previous_timestamp_s
+    ):
+        frame_step_s = 1.0 / fps if math.isfinite(fps) and fps > 0 else 0.0
+        candidate_timestamp_s = max(
+            candidate_timestamp_s,
+            fallback_timestamp_s,
+            safe_previous_timestamp_s + frame_step_s,
+        )
     return max(0.0, safe_previous_timestamp_s, candidate_timestamp_s)
 
 
@@ -485,13 +496,63 @@ def _draw_detection(
     )
 
 
-def _frame_timestamp_s(context: FrameContext) -> float:
-    candidate = context.captured_at_s
-    if candidate is None or not math.isfinite(candidate) or candidate < 0.0:
-        candidate = context.received_at_s
+def _frame_timestamp_s(
+    context: FrameContext,
+    previous_timestamp_s: float | None = None,
+    *,
+    previous_processing_started_at_s: float | None = None,
+    repair_with_processing_elapsed: bool = False,
+) -> float:
+    """Return a non-negative frame timestamp that never regresses within a session."""
+    captured_at_s = context.captured_at_s
+    capture_is_valid = (
+        captured_at_s is not None and math.isfinite(captured_at_s) and captured_at_s >= 0.0
+    )
+    candidate = float(captured_at_s) if capture_is_valid else context.received_at_s
     if not math.isfinite(candidate) or candidate < 0.0:
-        return 0.0
-    return float(candidate)
+        candidate = 0.0
+    previous = (
+        float(previous_timestamp_s)
+        if previous_timestamp_s is not None
+        and math.isfinite(previous_timestamp_s)
+        and previous_timestamp_s >= 0.0
+        else 0.0
+    )
+    if previous_timestamp_s is None:
+        return max(0.0, float(candidate))
+    if capture_is_valid and candidate > previous:
+        return float(candidate)
+    if repair_with_processing_elapsed:
+        previous_processing = previous_processing_started_at_s
+        processing_elapsed_s = (
+            context.processing_started_at_s - previous_processing
+            if previous_processing is not None
+            and math.isfinite(previous_processing)
+            and math.isfinite(context.processing_started_at_s)
+            and context.processing_started_at_s > previous_processing
+            else 0.0
+        )
+        repaired = previous + processing_elapsed_s
+        return repaired if repaired > previous else math.nextafter(previous, math.inf)
+    return max(previous, float(candidate))
+
+
+def _scheduler_timestamp_s(
+    context: FrameContext,
+    previous_timestamp_s: float | None = None,
+) -> float:
+    """Keep scheduler TTL and cooldown bookkeeping on the processing clock."""
+    candidate = context.processing_started_at_s
+    if not math.isfinite(candidate) or candidate < 0.0:
+        candidate = time.perf_counter()
+    previous = (
+        float(previous_timestamp_s)
+        if previous_timestamp_s is not None
+        and math.isfinite(previous_timestamp_s)
+        and previous_timestamp_s >= 0.0
+        else 0.0
+    )
+    return max(previous, float(candidate))
 
 
 class VisionSession:
@@ -510,6 +571,7 @@ class VisionSession:
         object_router: ObjectRouter,
         scene_event_manager: SceneEventManager,
         narration_scheduler: NarrationScheduler,
+        scheduler_uses_processing_clock: bool = False,
         maximum_state_gap_s: float | None = None,
         model_load_ms: float = 0.0,
     ) -> None:
@@ -527,9 +589,12 @@ class VisionSession:
         self.object_router = object_router
         self.scene_event_manager = scene_event_manager
         self.narration_scheduler = narration_scheduler
+        self.scheduler_uses_processing_clock = scheduler_uses_processing_clock
         self.maximum_state_gap_s = maximum_state_gap_s
         self.model_load_ms = model_load_ms
         self._last_processing_started_at_s: float | None = None
+        self._last_frame_timestamp_s: float | None = None
+        self._last_scheduler_timestamp_s: float | None = None
         self.processed_frames = 0
 
     def _reset_tracker(self) -> None:
@@ -552,6 +617,8 @@ class VisionSession:
         """Clear tracker, analyzer, event, and narration state for session reuse."""
         self._reset_state()
         self._last_processing_started_at_s = None
+        self._last_frame_timestamp_s = None
+        self._last_scheduler_timestamp_s = None
         self.processed_frames = 0
 
     def _reset_after_long_gap(self, processing_started_at_s: float) -> None:
@@ -575,8 +642,24 @@ class VisionSession:
         if context.processed_index < 0:
             raise ValueError("processed_index must be non-negative")
 
+        previous_processing_started_at_s = self._last_processing_started_at_s
         self._reset_after_long_gap(context.processing_started_at_s)
-        timestamp_s = _frame_timestamp_s(context)
+        timestamp_s = _frame_timestamp_s(
+            context,
+            self._last_frame_timestamp_s,
+            previous_processing_started_at_s=previous_processing_started_at_s,
+            repair_with_processing_elapsed=self.scheduler_uses_processing_clock,
+        )
+        scheduler_timestamp_s = (
+            _scheduler_timestamp_s(
+                context,
+                self._last_scheduler_timestamp_s,
+            )
+            if self.scheduler_uses_processing_clock
+            else timestamp_s
+        )
+        self._last_frame_timestamp_s = timestamp_s
+        self._last_scheduler_timestamp_s = scheduler_timestamp_s
         processing_started_at = time.perf_counter()
 
         inference_started_at = time.perf_counter()
@@ -667,8 +750,8 @@ class VisionSession:
             scene_events=scene_events,
         )
 
-        self.narration_scheduler.enqueue(analysis_events, now_s=timestamp_s)
-        selected = self.narration_scheduler.pop_next(now_s=timestamp_s)
+        self.narration_scheduler.enqueue(analysis_events, now_s=scheduler_timestamp_s)
+        selected = self.narration_scheduler.pop_next(now_s=scheduler_timestamp_s)
         selected_narrations = [selected] if selected is not None else []
         narrations = [narration.message for narration in selected_narrations]
 
@@ -792,6 +875,7 @@ def create_vision_session(
         object_router=object_router,
         scene_event_manager=scene_event_manager,
         narration_scheduler=narration_scheduler,
+        scheduler_uses_processing_clock=live_mode,
         maximum_state_gap_s=effective_gap_s,
         model_load_ms=model_load_ms,
     )

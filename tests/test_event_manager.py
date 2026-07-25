@@ -295,6 +295,135 @@ def test_low_detector_injected_signal_cannot_bypass_state_gate() -> None:
     assert manager.update([low_detector_signal], 1.0, scene_events=[changed]) == []
 
 
+def test_uncertain_legacy_signal_transition_waits_for_analyzer_confirmation() -> None:
+    manager = SceneEventManager(auto_presence=False)
+
+    def signal(
+        state: str,
+        *,
+        confidence: float,
+        is_uncertain: bool,
+        observed_state: str,
+    ) -> AnalysisResult:
+        return AnalysisResult(
+            object_type="traffic_light",
+            stable_id="stable-1",
+            state=state,
+            confidence=confidence,
+            attributes={
+                "detection_confidence": 0.9,
+                "minimum_detection_confidence": 0.2,
+                "signal_evidence_confidence": 0.95,
+                "observed_state": observed_state,
+            },
+            is_uncertain=is_uncertain,
+        )
+
+    assert (
+        manager.update(
+            [
+                signal(
+                    "GREEN",
+                    confidence=0.9,
+                    is_uncertain=False,
+                    observed_state="GREEN",
+                )
+            ],
+            0.0,
+        )
+        == []
+    )
+
+    pending = manager.update(
+        [
+            signal(
+                "GREEN",
+                confidence=0.0,
+                is_uncertain=True,
+                observed_state="RED",
+            )
+        ],
+        0.1,
+        scene_events=[
+            legacy_event(
+                "signal_changed",
+                0.1,
+                previous_state=SignalState.GREEN,
+                current_state=SignalState.RED,
+            )
+        ],
+    )
+    confirmed = manager.update(
+        [
+            signal(
+                "RED",
+                confidence=0.9,
+                is_uncertain=False,
+                observed_state="RED",
+            )
+        ],
+        0.2,
+    )
+
+    assert pending == []
+    assert [event.event_type for event in confirmed] == [OBJECT_STATE_CHANGED]
+    assert confirmed[0].previous_state == "GREEN"
+    assert confirmed[0].current_state == "RED"
+    assert confirmed[0].timestamp_s == 0.2
+
+
+def test_legacy_signal_transition_requires_matching_confirmed_analyzer_state() -> None:
+    manager = SceneEventManager(auto_presence=False)
+    green = result("GREEN", object_type="traffic_light")
+    manager.update([green], 0.0)
+
+    contradictory = manager.update(
+        [green],
+        0.1,
+        scene_events=[
+            legacy_event(
+                "signal_changed",
+                0.1,
+                previous_state=SignalState.GREEN,
+                current_state=SignalState.RED,
+            )
+        ],
+    )
+    confirmed = manager.update(
+        [result("RED", object_type="traffic_light")],
+        0.2,
+    )
+
+    assert contradictory == []
+    assert [event.event_type for event in confirmed] == [OBJECT_STATE_CHANGED]
+    assert confirmed[0].previous_state == "GREEN"
+    assert confirmed[0].current_state == "RED"
+
+
+def test_pending_legacy_signal_transition_survives_disabled_state_derivation() -> None:
+    manager = SceneEventManager(auto_presence=False, derive_state_changes=False)
+    manager.update([result("GREEN")], 0.0)
+    pending = manager.update(
+        [result("GREEN", confidence=0.0, is_uncertain=True)],
+        0.1,
+        scene_events=[
+            legacy_event(
+                "signal_changed",
+                0.1,
+                previous_state=SignalState.GREEN,
+                current_state=SignalState.RED,
+            )
+        ],
+    )
+    confirmed = manager.update([result("RED")], 0.2)
+
+    assert pending == []
+    assert [event.event_type for event in confirmed] == [OBJECT_STATE_CHANGED]
+    assert confirmed[0].previous_state == "GREEN"
+    assert confirmed[0].current_state == "RED"
+    assert confirmed[0].timestamp_s == 0.2
+
+
 def test_confirmed_bus_fields_create_approaching_and_text_events_once() -> None:
     manager = SceneEventManager(auto_presence=False, derive_state_changes=False)
     bus = AnalysisResult(

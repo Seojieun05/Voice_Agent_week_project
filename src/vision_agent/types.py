@@ -65,11 +65,14 @@ class AnalysisResult:
     confidence: float
     attributes: dict[str, object] = field(default_factory=dict)
     is_uncertain: bool = False
+    analyzer_name: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         if isinstance(self.state, Enum):
             payload["state"] = self.state.value
+        if self.analyzer_name is None:
+            payload.pop("analyzer_name")
         return payload
 
 

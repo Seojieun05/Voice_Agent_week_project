@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from .analyzers import (
     BusAnalyzer,
     GenericVisionAnalyzer,
@@ -61,12 +63,13 @@ class ObjectRouter:
         precomputed_signal_result: SignalStateResult | None = None,
     ) -> AnalysisResult:
         analyzer = self.analyzer_for(detection.class_name)
-        return analyzer.analyze(
+        result = analyzer.analyze(
             detection,
             stable_id=resolve_stable_id(detection, stable_id),
             crop=crop,
             precomputed_signal_result=precomputed_signal_result,
         )
+        return replace(result, analyzer_name=type(analyzer).__name__)
 
     def route(
         self,
