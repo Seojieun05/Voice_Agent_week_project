@@ -77,8 +77,8 @@ class SceneStateStore:
         max_recent_events: int = 20,
         max_narrations: int = 5,
         max_sessions: int = 256,
-        event_ttl_s: float = 10.0,
-        narration_ttl_s: float = 15.0,
+        event_ttl_s: float = 5.0,
+        narration_ttl_s: float = 8.0,
     ) -> None:
         if max_recent_events < 1:
             raise ValueError("max_recent_events must be at least 1")

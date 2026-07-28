@@ -38,7 +38,8 @@ SYSTEM_PROMPT = (
     "- latest_narrations: 시스템이 최근 말한 안내 문장, seconds_since_last_frame: 마지막 "
     "프레임 이후 지난 시간(초)입니다.\n"
     "규칙:\n"
-    "1. 한국어로 짧고 명확하게, 전체 3~4문장 이내로 답합니다.\n"
+    "1. 한국어로 짧고 명확하게, 전체 3~4문장 이내로 답합니다. 항상 지금 이 순간의 화면 "
+    "기준으로 현재형으로 답하며, 몇 초 전 상황을 지금 상황처럼 말하지 않습니다.\n"
     "2. '앞에 뭐가 보여', '설명해줘' 같은 장면 설명 요청에는 다음 구조로 답합니다: "
     "먼저 한 문장으로 전체 장면을 요약하고, 이어서 visible_objects의 첫 번째(가장 중요한) "
     "물체 하나를 2문장 이내로 구체적으로 설명합니다(위치, 상태, 적힌 글자). 사소한 물체를 "
@@ -91,6 +92,76 @@ class ChatClientProtocol(Protocol):
     ) -> str: ...
 
 
+# Frequent question types get a dedicated answer template so users receive
+# a direct answer first (e.g. 예/아니요) instead of a generic scene summary.
+_QUESTION_TYPE_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("crossing", ("건너", "횡단")),
+    (
+        "can_i_go",
+        (
+            "가도 돼",
+            "가도돼",
+            "가도 될",
+            "가도될",
+            "지나가도",
+            "걸어가도",
+            "출발해도",
+            "이동해도",
+            "앞으로 가",
+        ),
+    ),
+    ("read_text", ("써있", "써 있", "쓰여", "적혀", "뭐라고", "뭐라", "글자", "글씨", "읽어")),
+    ("find_object", ("어디", "찾아")),
+    ("describe", ("보여", "보이", "설명", "묘사", "장면", "상황", "주변에 뭐")),
+)
+
+QUESTION_GUIDANCE: Mapping[str, str] = {
+    "crossing": (
+        "질문 유형: 횡단 가능 여부. 첫 문장에서 감지된 신호 상태를 바로 말합니다"
+        "(예: '신호가 초록불로 감지됩니다'). '건너세요' 같은 직접 명령은 하지 말고, "
+        "신호 상태와 근거를 말한 뒤 차량 등 실제 주변 확인이 필요하다고 한 번 덧붙입니다. "
+        "신호등이 감지되지 않으면 첫 문장에서 그렇게 말합니다."
+    ),
+    "can_i_go": (
+        "질문 유형: 진행 가능 여부. 반드시 '네' 또는 '아니요'로 답을 시작합니다. "
+        "전방(중앙 또는 전방 전체)에 장애물이나 사람이 있으면 '아니요'와 함께 무엇이 어디에 "
+        "있는지 말합니다. 진행 방향이 비어 있으면 '네'라고 말하고 천천히 확인하며 이동하라고 "
+        "짧게 덧붙입니다. 왼쪽/오른쪽에만 있는 물체는 진행을 막는 것이 아니므로 '아니요'의 "
+        "근거로 삼지 않습니다. 차도나 횡단보도 상황이면 신호와 차량 확인이 필요하다고 "
+        "덧붙입니다."
+    ),
+    "read_text": (
+        "질문 유형: 글자 읽기. 읽을 수 있는 글자 내용을 첫 문장에서 바로 말합니다. "
+        "글자가 감지되지 않으면 첫 문장에서 그렇게 말합니다."
+    ),
+    "find_object": (
+        "질문 유형: 물체 위치 찾기. 찾는 물체가 보이면 첫 문장에서 위치"
+        "(왼쪽/중앙/오른쪽)를 바로 말합니다. 보이지 않으면 지금 화면에는 없다고 말합니다."
+    ),
+    "describe": (
+        "질문 유형: 장면 설명. 한 문장으로 전체 장면을 요약한 뒤, 가장 중요한 물체 하나를 "
+        "2문장 이내로 구체적으로(위치, 상태, 적힌 글자) 설명합니다."
+    ),
+}
+
+
+def classify_question(user_question: str) -> str:
+    """Classify a question into a frequent type, or 'general' if none match."""
+    for question_type, keywords in _QUESTION_TYPE_KEYWORDS:
+        if any(keyword in user_question for keyword in keywords):
+            return question_type
+    return "general"
+
+
+def system_prompt_for(user_question: str, *, vision: bool = False) -> str:
+    """Base prompt plus the answer template for the detected question type."""
+    base = VISION_SYSTEM_PROMPT if vision else SYSTEM_PROMPT
+    guidance = QUESTION_GUIDANCE.get(classify_question(user_question))
+    if guidance is None:
+        return base
+    return f"{base}\n{guidance}"
+
+
 def build_chat_messages(
     scene_state: Mapping[str, object],
     user_question: str,
@@ -101,7 +172,7 @@ def build_chat_messages(
         "user_question": user_question,
     }
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt_for(user_question)},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
     ]
 
@@ -216,7 +287,7 @@ class GrokChatClient:
         body = {
             "model": self._config.resolved_vision_model,
             "messages": [
-                {"role": "system", "content": VISION_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt_for(user_question, vision=True)},
                 {
                     "role": "user",
                     "content": [

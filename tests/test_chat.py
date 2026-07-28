@@ -7,12 +7,15 @@ import pytest
 
 from vision_agent.chat import (
     DEFAULT_GROK_MODEL,
+    QUESTION_GUIDANCE,
     SYSTEM_PROMPT,
     VISION_SYSTEM_PROMPT,
     ChatServiceError,
     GrokChatClient,
     GrokConfig,
     build_chat_messages,
+    classify_question,
+    system_prompt_for,
 )
 
 SCENE_STATE = {
@@ -44,10 +47,43 @@ def _answer_response(text: str) -> httpx.Response:
 def test_build_chat_messages_embeds_scene_state_and_question() -> None:
     messages = build_chat_messages(SCENE_STATE, "지금 건너도 돼?")
 
-    assert messages[0] == {"role": "system", "content": SYSTEM_PROMPT}
+    system_prompt = messages[0]["content"]
+    assert system_prompt.startswith(SYSTEM_PROMPT)
+    assert QUESTION_GUIDANCE["crossing"] in system_prompt
     payload = json.loads(messages[1]["content"])
     assert payload["scene_state"] == SCENE_STATE
     assert payload["user_question"] == "지금 건너도 돼?"
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        ("지금 건너도 돼?", "crossing"),
+        ("횡단보도 건너가도 될까?", "crossing"),
+        ("앞으로 가도 돼?", "can_i_go"),
+        ("이대로 걸어가도 돼?", "can_i_go"),
+        ("표지판에 뭐라고 써있어?", "read_text"),
+        ("버스 정류장이 어디 있어?", "find_object"),
+        ("앞에 뭐가 보여?", "describe"),
+        ("주변 상황 알려줘", "describe"),
+        ("고마워", "general"),
+    ],
+)
+def test_classify_question(question: str, expected: str) -> None:
+    assert classify_question(question) == expected
+
+
+def test_system_prompt_for_appends_guidance_only_when_type_matches() -> None:
+    go_prompt = system_prompt_for("앞으로 가도 돼?")
+    assert go_prompt.startswith(SYSTEM_PROMPT)
+    assert "'네' 또는 '아니요'로 답을 시작" in go_prompt
+
+    general_prompt = system_prompt_for("고마워")
+    assert general_prompt == SYSTEM_PROMPT
+
+    vision_prompt = system_prompt_for("앞으로 가도 돼?", vision=True)
+    assert vision_prompt.startswith(VISION_SYSTEM_PROMPT)
+    assert QUESTION_GUIDANCE["can_i_go"] in vision_prompt
 
 
 def test_create_answer_sends_expected_request_and_returns_text() -> None:

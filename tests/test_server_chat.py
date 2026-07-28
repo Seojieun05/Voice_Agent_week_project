@@ -609,3 +609,62 @@ def test_text_only_chat_client_still_works_with_vlm_enabled() -> None:
     assert payload["answer_text"] == "텍스트 전용 답변"
     assert payload["vlm"]["used"] is False
     assert payload["vlm"]["reason"] == "client_unsupported"
+
+
+def test_position_label_uses_overlap_not_center() -> None:
+    from vision_agent.server import _position_label
+
+    # Object occupying the right half: center is near the middle but the
+    # user experiences it on the right.
+    assert _position_label(50.0, 100.0, 100) == "오른쪽"
+    assert _position_label(0.0, 50.0, 100) == "왼쪽"
+    assert _position_label(40.0, 60.0, 100) == "중앙"
+    # Very wide object blocks the whole path.
+    assert _position_label(10.0, 90.0, 100) == "전방 전체"
+    assert _position_label(0.0, 0.0, 100) is None
+
+
+def test_vlm_frame_selection_never_picks_stale_frames() -> None:
+    from vision_agent.frame_buffer import BufferedFrame
+    from vision_agent.server import _select_vlm_image
+
+    def noisy_jpeg() -> bytes:
+        rng = np.random.default_rng(seed=7)
+        frame = rng.integers(0, 255, size=(16, 24, 3), dtype=np.uint8)
+        ok, encoded = cv2.imencode(".jpg", frame)
+        assert ok
+        return encoded.tobytes()
+
+    config = _test_config()
+    old_sharp = BufferedFrame(sequence_id=1, received_at_ms=0, jpeg_bytes=noisy_jpeg())
+    new_flat = BufferedFrame(sequence_id=2, received_at_ms=10_000, jpeg_bytes=_jpeg(200))
+
+    selected = _select_vlm_image([old_sharp, new_flat], config)
+
+    assert selected is not None
+    decoded = cv2.imdecode(np.frombuffer(selected, dtype=np.uint8), cv2.IMREAD_COLOR)
+    # The stale-but-sharp frame is outside the freshness window, so the
+    # flat bright frame must win.
+    assert float(decoded.mean()) > 150.0
+    assert float(decoded.std()) < 30.0
+
+
+def test_vlm_frame_selection_prefers_sharper_frame_within_window() -> None:
+    from vision_agent.frame_buffer import BufferedFrame
+    from vision_agent.server import _select_vlm_image
+
+    rng = np.random.default_rng(seed=11)
+    noisy = rng.integers(0, 255, size=(16, 24, 3), dtype=np.uint8)
+    ok, noisy_encoded = cv2.imencode(".jpg", noisy)
+    assert ok
+
+    config = _test_config()
+    sharp = BufferedFrame(sequence_id=1, received_at_ms=9_800, jpeg_bytes=noisy_encoded.tobytes())
+    flat = BufferedFrame(sequence_id=2, received_at_ms=10_000, jpeg_bytes=_jpeg(200))
+
+    selected = _select_vlm_image([sharp, flat], config)
+
+    assert selected is not None
+    decoded = cv2.imdecode(np.frombuffer(selected, dtype=np.uint8), cv2.IMREAD_COLOR)
+    # Both frames are fresh; the noisy (higher Laplacian variance) one wins.
+    assert float(decoded.std()) > 30.0

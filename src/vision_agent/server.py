@@ -601,6 +601,30 @@ def _visible_object_text(attributes: Mapping[str, object]) -> str | None:
     return None
 
 
+def _position_label(left: float, right: float, frame_width: int) -> str | None:
+    """Describe where an object sits horizontally, by overlap not center.
+
+    A large object (e.g. furniture filling the right half) can have its
+    center near the middle while actually occupying one side; the third
+    with the largest overlap is what a walking user experiences.
+    """
+    if frame_width <= 0:
+        return None
+    left = max(0.0, min(left, float(frame_width)))
+    right = max(0.0, min(right, float(frame_width)))
+    if right <= left:
+        return None
+    if (right - left) >= frame_width * 0.75:
+        return "전방 전체"
+    third = frame_width / 3.0
+    overlaps = {
+        "왼쪽": max(0.0, min(right, third) - left),
+        "중앙": max(0.0, min(right, 2.0 * third) - max(left, third)),
+        "오른쪽": max(0.0, right - max(left, 2.0 * third)),
+    }
+    return max(overlaps, key=overlaps.__getitem__)
+
+
 def _serialized_visible_objects(
     analysis: object,
     frame_width: int,
@@ -638,13 +662,9 @@ def _serialized_visible_objects(
             left = _finite_number(xyxy[0])
             right = _finite_number(xyxy[2])
             if left is not None and right is not None:
-                center = (left + right) / 2.0 / frame_width
-                if center < 1.0 / 3.0:
-                    entry["position"] = "왼쪽"
-                elif center > 2.0 / 3.0:
-                    entry["position"] = "오른쪽"
-                else:
-                    entry["position"] = "중앙"
+                position = _position_label(left, right, frame_width)
+                if position is not None:
+                    entry["position"] = position
 
         result = results_by_index.get(index)
         if result is not None:
@@ -732,17 +752,28 @@ def _frame_sharpness(frame: np.ndarray) -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
+# Sharpness comparison must never trade recency for clarity: only frames
+# this close to the newest one may compete, so answers describe "now".
+_VLM_CANDIDATE_WINDOW_MS = 1500
+
+
 def _select_vlm_image(frames: Sequence[BufferedFrame], config: ServerConfig) -> bytes | None:
-    """Pick the sharpest of the most recent frames and bound its size.
+    """Pick the sharpest of the freshest frames and bound its size.
 
     CPU-bound (JPEG decode + Laplacian); run off the event loop. Returns
     re-encoded JPEG bytes within the configured limits, or None when no
     buffered frame decodes.
     """
+    if not frames:
+        return None
+    newest_ms = max(frame.received_at_ms for frame in frames)
+    candidates = [
+        frame for frame in frames if newest_ms - frame.received_at_ms <= _VLM_CANDIDATE_WINDOW_MS
+    ]
     best_frame: np.ndarray | None = None
     best_sharpness = -1.0
     # Newest-first so ties prefer the most recent frame.
-    for buffered in list(frames)[::-1][:3]:
+    for buffered in sorted(candidates, key=lambda frame: frame.received_at_ms, reverse=True)[:3]:
         encoded = np.frombuffer(buffered.jpeg_bytes, dtype=np.uint8)
         frame = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
         if frame is None or frame.size == 0:
