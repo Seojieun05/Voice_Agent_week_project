@@ -651,11 +651,7 @@ def _distance_label(
     # "가까움" must mean imminent (roughly within arm's-to-two-steps reach):
     # a pedestrian a few meters away already fills half the frame height, so
     # close requires a dominant box or one that reaches the frame bottom.
-    if (
-        height_ratio >= 0.8
-        or area_ratio >= 0.4
-        or (height_ratio >= 0.55 and bottom_ratio >= 0.85)
-    ):
+    if height_ratio >= 0.8 or area_ratio >= 0.4 or (height_ratio >= 0.55 and bottom_ratio >= 0.85):
         return "가까움"
     if height_ratio >= 0.35 or area_ratio >= 0.12:
         return "중간"
@@ -725,21 +721,30 @@ def _serialized_visible_objects(
             state = getattr(result, "state", None)
             if state is not None:
                 state_text = str(getattr(state, "value", state)).strip()
-                if state_text:
+                # Placeholder analyzer states are internal bookkeeping, not
+                # information; forwarding them made every pedestrian carry
+                # "state": "UNKNOWN" and an uncertainty flag.
+                if state_text and state_text.upper() not in {"UNKNOWN", "DESCRIBED"}:
                     entry["state"] = state_text
-            if bool(getattr(result, "is_uncertain", False)):
-                entry["is_uncertain"] = True
             attributes = getattr(result, "attributes", None)
             if isinstance(attributes, Mapping):
                 text = _visible_object_text(attributes)
                 if text is not None:
                     entry["text"] = text
+                description = attributes.get("description")
+                if isinstance(description, str) and description.strip():
+                    entry["description"] = description.strip()
 
         confirmed = "state" in entry or "text" in entry
-        # Raw confidence numbers push the chat model into hedging every
-        # sentence; keep only a boolean flag for genuinely weak detections
-        # and drop unconfirmed noise entirely.
-        if not confirmed and confidence is not None:
+        if confirmed:
+            # Analyzer-level uncertainty only matters alongside an actual
+            # analyzer finding (a signal color, confirmed text).
+            if result is not None and bool(getattr(result, "is_uncertain", False)):
+                entry["is_uncertain"] = True
+        elif confidence is not None:
+            # Raw confidence numbers push the chat model into hedging every
+            # sentence; keep only a boolean flag for genuinely weak detections
+            # and drop unconfirmed noise entirely.
             if confidence < _MIN_VISIBLE_CONFIDENCE:
                 continue
             if confidence < _UNCERTAIN_VISIBLE_CONFIDENCE:
@@ -795,12 +800,21 @@ def _vlm_trigger_reason(
         return "question_needs_vision"
     if any(keyword in question for keyword in _VLM_DETAIL_KEYWORDS):
         return "detail_requested"
-    # Go/no-go and crossing judgments need the image: path/sidewalk presence
-    # and signal countdown digits are not in the YOLO object list.
     from .chat import classify_question
 
-    if classify_question(question) in {"can_i_go", "crossing"}:
+    question_type = classify_question(question)
+    # Go/no-go and crossing judgments need the image: path/sidewalk presence
+    # and signal countdown digits are not in the YOLO object list.
+    if question_type in {"can_i_go", "crossing"}:
         return "path_check"
+    # A describe answer built only from far-away unlabeled objects says
+    # nothing about the actual surroundings (river, park, buildings) —
+    # the image is the only informative source then.
+    if question_type == "describe" and not any(
+        item.get("distance") != "멀리" or "state" in item or "text" in item
+        for item in snapshot.visible_objects
+    ):
+        return "sparse_scene"
     return None
 
 

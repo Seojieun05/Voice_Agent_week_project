@@ -243,10 +243,17 @@ class _FakeRichSession:
                 _FakeDetection("person", 0.95, (8.0, 0.0, 16.0, 10.0)),
                 _FakeDetection("person", 0.4, (0.0, 0.0, 8.0, 10.0)),
                 _FakeDetection("chair", 0.2, (8.0, 0.0, 16.0, 10.0)),
+                _FakeDetection("person", 0.9, (8.0, 0.0, 16.0, 10.0)),
+                _FakeDetection("person", 0.13, (8.0, 0.0, 16.0, 10.0)),
             ],
             analysis_results_by_index={
                 0: _FakeResult("bus", attributes={"route_number": "146"}),
                 1: _FakeResult("pedestrian_signal", state="GREEN", is_uncertain=True),
+                # Placeholder analyzer output (generic analyzer): the UNKNOWN
+                # state and its uncertainty flag must not reach the chat AI,
+                # and must not shield weak detections from the noise filter.
+                5: _FakeResult("person", state="UNKNOWN", is_uncertain=True),
+                6: _FakeResult("person", state="UNKNOWN", is_uncertain=True),
             },
         )
 
@@ -301,6 +308,11 @@ def test_chat_scene_state_includes_visible_objects_with_text_and_position() -> N
             "position": "오른쪽",
             "distance": "중간",
             "text": "146",
+        },
+        {
+            "object_type": "person",
+            "position": "중앙",
+            "distance": "중간",
         },
         {
             "object_type": "person",
@@ -476,6 +488,24 @@ def _snapshot(
         (({"object_type": "person"},), 0.9, "앞으로 가도 돼?", "path_check"),
         (({"object_type": "person"},), 0.9, "지금 건너도 돼?", "path_check"),
         (({"object_type": "person"},), 0.9, "앞에 뭐가 보여?", None),
+        (
+            ({"object_type": "person", "distance": "멀리"},),
+            0.9,
+            "앞에 뭐가 보여?",
+            "sparse_scene",
+        ),
+        (
+            ({"object_type": "person", "distance": "중간"},),
+            0.9,
+            "앞에 뭐가 보여?",
+            None,
+        ),
+        (
+            ({"object_type": "sign", "distance": "멀리", "text": "출구"},),
+            0.9,
+            "앞에 뭐가 보여?",
+            None,
+        ),
     ],
 )
 def test_vlm_trigger_reasons(
