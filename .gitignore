@@ -30,3 +30,7 @@ datasets/public_baseline/review/*
 
 # Environment
 .env
+
+# md
+claude.md
+codex.md
