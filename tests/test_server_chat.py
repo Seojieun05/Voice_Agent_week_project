@@ -721,3 +721,31 @@ def test_distance_label_scales_with_apparent_size() -> None:
     # Dominant box filling most of the frame height.
     assert _distance_label(20.0, 80.0, 10.0, 90.0, 100, 100) == "가까움"
     assert _distance_label(0.0, 10.0, 0.0, 10.0, 0, 100) is None
+
+
+def test_wide_background_object_not_reported_as_blocking() -> None:
+    from vision_agent.server import _serialized_visible_objects
+
+    # A train spanning the whole frame width in the background (short box
+    # high in the frame) must not read as "전방 전체".
+    analysis = _FakeRichAnalysis(
+        detections=[_FakeDetection("train", 0.8, (0.0, 4.0, 24.0, 7.0))],
+        analysis_results_by_index={},
+    )
+
+    objects, _confidence = _serialized_visible_objects(analysis, 24, 16)
+
+    assert objects == [{"object_type": "train", "position": "중앙", "distance": "중간"}]
+
+
+def test_wide_close_object_keeps_blocking_position() -> None:
+    from vision_agent.server import _serialized_visible_objects
+
+    analysis = _FakeRichAnalysis(
+        detections=[_FakeDetection("bench", 0.8, (0.0, 2.0, 24.0, 16.0))],
+        analysis_results_by_index={},
+    )
+
+    objects, _confidence = _serialized_visible_objects(analysis, 24, 16)
+
+    assert objects == [{"object_type": "bench", "position": "전방 전체", "distance": "가까움"}]

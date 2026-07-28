@@ -712,6 +712,11 @@ def _serialized_visible_objects(
                     )
                     if distance is not None:
                         entry["distance"] = distance
+                    # A frame-wide but not-close box (a train or bridge in
+                    # the background) does not block the path; "전방 전체"
+                    # is reserved for objects the user could walk into.
+                    if entry.get("position") == "전방 전체" and distance != "가까움":
+                        entry["position"] = "중앙"
 
         result = results_by_index.get(index)
         if result is not None:
