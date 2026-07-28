@@ -12,7 +12,8 @@ import base64
 import json
 import logging
 import os
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -82,6 +83,90 @@ class ChatServiceError(Exception):
         self.retryable = retryable
 
 
+# Tool executor: (tool_name, parsed_arguments) -> JSON-serializable result.
+ToolExecutor = Callable[[str, Mapping[str, object]], object]
+
+CHAT_TOOLS: list[dict[str, object]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_scene",
+            "description": (
+                "현재 카메라에 보이는 모든 YOLO 감지 객체를 반환합니다. 각 객체에 클래스, "
+                "confidence, bbox 좌표, 추적 ID, 방향(왼쪽/중앙/오른쪽), 거리(가까움/중간/"
+                "멀리), 화면 점유 비율과 탐지 시각이 포함됩니다."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_object",
+            "description": (
+                "특정 객체가 현재 화면에 보이는지 찾습니다. 탐지 여부, 화면 방향, 크기, "
+                "confidence를 반환합니다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "찾을 객체 이름. 영문 클래스 이름(person, car, bus, "
+                            "traffic_light, bollard 등) 또는 한국어 이름(사람, 버스, "
+                            "신호등 등)"
+                        ),
+                    }
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_traffic_light",
+            "description": "신호등/보행자 신호의 상태와 판정 신뢰도, 마지막 갱신 시각을 반환합니다.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_frame_with_vlm",
+            "description": (
+                "현재 카메라 프레임 이미지를 비전 모델로 직접 분석합니다. 객체 목록만으로 "
+                "답하기 어려울 때(장면 묘사, 글자·표지판 읽기, 길 상태 확인, 색상 등) "
+                "사용하세요. 호출 간 쿨다운이 있어 실패할 수 있습니다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "이미지에 대해 물어볼 구체적인 질문",
+                    }
+                },
+                "required": ["question"],
+            },
+        },
+    },
+]
+
+TOOL_PROMPT = (
+    "도구 사용 규칙: 입력의 scene_state는 요약일 뿐이며, 화면에 대한 사실을 답하기 전에 "
+    "반드시 도구로 최신 정보를 확인합니다.\n"
+    "- 객체의 개수·목록·위치를 묻는 질문: get_current_scene을 호출합니다.\n"
+    "- 특정 물체가 있는지 묻는 질문: find_object를 호출합니다.\n"
+    "- 신호등·횡단 관련 질문: check_traffic_light를 호출합니다.\n"
+    "- 장면 묘사, 글자 읽기, 길·바닥 상태, 색상 등 이미지를 직접 봐야 하는 질문과 "
+    "'가도 돼?' 같은 이동 판단: analyze_frame_with_vlm을 호출합니다.\n"
+    "도구 결과에 없는 내용을 지어내지 않으며, 도구가 오류를 반환하면 가진 정보만으로 "
+    "짧게 답합니다. 같은 도구를 반복 호출하지 않습니다."
+)
+
+
 class ChatClientProtocol(Protocol):
     """Runtime contract used by the server and its test fakes."""
 
@@ -93,6 +178,13 @@ class ChatClientProtocol(Protocol):
         user_question: str,
         jpeg_bytes: bytes,
     ) -> str: ...
+
+    def create_tool_answer(
+        self,
+        scene_state: Mapping[str, object],
+        user_question: str,
+        execute_tool: ToolExecutor,
+    ) -> tuple[str, list[dict[str, object]]]: ...
 
 
 # Frequent question types get a dedicated answer template so users receive
@@ -336,7 +428,104 @@ class GrokChatClient:
                 )
         raise AssertionError("unreachable")  # pragma: no cover
 
-    def _complete(self, body: Mapping[str, object], *, timeout_s: float) -> str:
+    def create_tool_answer(
+        self,
+        scene_state: Mapping[str, object],
+        user_question: str,
+        execute_tool: ToolExecutor,
+        *,
+        max_rounds: int = 4,
+    ) -> tuple[str, list[dict[str, object]]]:
+        """Agentic loop: let Grok call scene tools before answering.
+
+        ``execute_tool`` runs each requested tool locally; its results are
+        fed back as ``tool`` messages until Grok produces a final answer.
+        Returns the answer plus a log of the tools that were called.
+        """
+        payload_text = json.dumps(
+            {"scene_state": dict(scene_state), "user_question": user_question},
+            ensure_ascii=False,
+        )
+        messages: list[dict[str, object]] = [
+            {
+                "role": "system",
+                "content": system_prompt_for(user_question) + "\n" + TOOL_PROMPT,
+            },
+            {"role": "user", "content": payload_text},
+        ]
+        called: list[dict[str, object]] = []
+
+        for _round in range(max_rounds):
+            body = {
+                "model": self._config.model,
+                "messages": messages,
+                "tools": CHAT_TOOLS,
+                "tool_choice": "auto",
+                "temperature": self._config.temperature,
+                "max_tokens": self._config.max_tokens,
+            }
+            message = self._request_message(body, timeout_s=self._config.timeout_s)
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list) or not tool_calls:
+                answer_text = str(message.get("content") or "").strip()
+                if not answer_text:
+                    raise ChatServiceError("EMPTY_ANSWER", "Grok API returned an empty answer")
+                return answer_text, called
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": message.get("content"),
+                    "tool_calls": tool_calls,
+                }
+            )
+            for call in tool_calls:
+                function = call.get("function") if isinstance(call, Mapping) else None
+                name = str((function or {}).get("name", "")).strip()
+                raw_arguments = (function or {}).get("arguments")
+                try:
+                    arguments = json.loads(raw_arguments) if raw_arguments else {}
+                except (ValueError, TypeError):
+                    arguments = {}
+                if not isinstance(arguments, dict):
+                    arguments = {}
+                started_s = time.perf_counter()
+                try:
+                    result = execute_tool(name, arguments)
+                except Exception:
+                    # A broken tool must degrade the answer, not kill it.
+                    LOGGER.exception("chat tool execution failed name=%s", name)
+                    result = {"error": "tool_execution_failed"}
+                called.append(
+                    {
+                        "name": name,
+                        "latency_ms": round((time.perf_counter() - started_s) * 1000.0, 1),
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id") if isinstance(call, Mapping) else None,
+                        "content": json.dumps(result, ensure_ascii=False, default=str),
+                    }
+                )
+
+        # Tool budget exhausted: demand a final answer without more calls.
+        messages.append(
+            {
+                "role": "user",
+                "content": "도구 호출 없이 지금까지 얻은 정보만으로 최종 답변을 말해주세요.",
+            }
+        )
+        body = {
+            "model": self._config.model,
+            "messages": messages,
+            "temperature": self._config.temperature,
+            "max_tokens": self._config.max_tokens,
+        }
+        return self._complete(body, timeout_s=self._config.timeout_s), called
+
+    def _request_message(self, body: Mapping[str, object], *, timeout_s: float) -> dict:
         try:
             response = self._client.post("/chat/completions", json=dict(body), timeout=timeout_s)
         except httpx.TimeoutException as exc:
@@ -364,13 +553,28 @@ class GrokChatClient:
 
         try:
             payload = response.json()
-            answer = payload["choices"][0]["message"]["content"]
+            message = payload["choices"][0]["message"]
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             raise ChatServiceError(
                 "INVALID_UPSTREAM_RESPONSE",
                 "Grok API returned an unexpected response shape",
             ) from exc
+        if not isinstance(message, dict):
+            raise ChatServiceError(
+                "INVALID_UPSTREAM_RESPONSE",
+                "Grok API returned an unexpected response shape",
+            )
+        return message
 
+    def _complete(self, body: Mapping[str, object], *, timeout_s: float) -> str:
+        message = self._request_message(body, timeout_s=timeout_s)
+        try:
+            answer = message["content"]
+        except KeyError as exc:
+            raise ChatServiceError(
+                "INVALID_UPSTREAM_RESPONSE",
+                "Grok API returned an unexpected response shape",
+            ) from exc
         answer_text = str(answer).strip()
         if not answer_text:
             raise ChatServiceError(

@@ -311,3 +311,111 @@ def test_config_from_environment_accepts_xai_fallback(
 def test_grok_config_rejects_invalid_values(kwargs: dict[str, object], message: str) -> None:
     with pytest.raises(ValueError, match=message):
         GrokConfig(**kwargs)  # type: ignore[arg-type]
+
+
+def _tool_call_response(call_id: str, name: str, arguments: str) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "choices": [
+                {
+                    "message": {
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": arguments},
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+    )
+
+
+def test_create_tool_answer_executes_tools_and_returns_final() -> None:
+    requests: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return _tool_call_response("call_1", "find_object", '{"name": "bus"}')
+        return _answer_response("버스가 오른쪽에 있습니다.")
+
+    executed: list[tuple[str, dict]] = []
+
+    def execute(name: str, args: dict) -> dict:
+        executed.append((name, dict(args)))
+        return {"found": True, "direction": "오른쪽"}
+
+    answer, called = _client(handler).create_tool_answer(SCENE_STATE, "버스 어디 있어?", execute)
+
+    assert answer == "버스가 오른쪽에 있습니다."
+    assert executed == [("find_object", {"name": "bus"})]
+    assert called[0]["name"] == "find_object"
+    assert called[0]["latency_ms"] >= 0
+
+    first = requests[0]
+    assert first["tool_choice"] == "auto"
+    assert [tool["function"]["name"] for tool in first["tools"]] == [
+        "get_current_scene",
+        "find_object",
+        "check_traffic_light",
+        "analyze_frame_with_vlm",
+    ]
+    second = requests[1]
+    assert [message["role"] for message in second["messages"]] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    tool_message = second["messages"][3]
+    assert tool_message["tool_call_id"] == "call_1"
+    assert json.loads(tool_message["content"]) == {"found": True, "direction": "오른쪽"}
+
+
+def test_create_tool_answer_survives_tool_exception_and_bad_arguments() -> None:
+    requests: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return _tool_call_response("call_1", "get_current_scene", "not-json{{")
+        return _answer_response("답변입니다.")
+
+    def execute(name: str, args: dict) -> dict:
+        assert args == {}
+        raise RuntimeError("boom")
+
+    answer, called = _client(handler).create_tool_answer(SCENE_STATE, "질문", execute)
+
+    assert answer == "답변입니다."
+    assert called[0]["name"] == "get_current_scene"
+    tool_message = requests[1]["messages"][3]
+    assert json.loads(tool_message["content"]) == {"error": "tool_execution_failed"}
+
+
+def test_create_tool_answer_forces_final_after_max_rounds() -> None:
+    requests: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        if "tools" in body:
+            return _tool_call_response(f"call_{len(requests)}", "check_traffic_light", "{}")
+        return _answer_response("최종 답변")
+
+    answer, called = _client(handler).create_tool_answer(
+        SCENE_STATE,
+        "질문",
+        lambda name, args: {"state": "RED"},
+        max_rounds=2,
+    )
+
+    assert answer == "최종 답변"
+    assert len(called) == 2
+    assert "tools" not in requests[-1]
+    assert requests[-1]["messages"][-1]["role"] == "user"

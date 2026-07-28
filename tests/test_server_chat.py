@@ -733,7 +733,7 @@ def test_wide_background_object_not_reported_as_blocking() -> None:
         analysis_results_by_index={},
     )
 
-    objects, _confidence = _serialized_visible_objects(analysis, 24, 16)
+    objects, _confidence, _raw = _serialized_visible_objects(analysis, 24, 16)
 
     assert objects == [{"object_type": "train", "position": "중앙", "distance": "중간"}]
 
@@ -746,7 +746,7 @@ def test_wide_close_object_keeps_blocking_position() -> None:
         analysis_results_by_index={},
     )
 
-    objects, _confidence = _serialized_visible_objects(analysis, 24, 16)
+    objects, _confidence, _raw = _serialized_visible_objects(analysis, 24, 16)
 
     assert objects == [{"object_type": "bench", "position": "전방 전체", "distance": "가까움"}]
 
@@ -765,6 +765,209 @@ def test_own_feet_person_box_is_ignored() -> None:
         analysis_results_by_index={},
     )
 
-    objects, _confidence = _serialized_visible_objects(analysis, 24, 16)
+    objects, _confidence, _raw = _serialized_visible_objects(analysis, 24, 16)
 
     assert objects == [{"object_type": "person", "position": "중앙", "distance": "가까움"}]
+
+
+def _raw_snapshot() -> SceneSnapshot:
+    return SceneSnapshot(
+        session_id="s",
+        visible_objects=(
+            {
+                "object_type": "pedestrian_signal",
+                "position": "중앙",
+                "state": "GREEN",
+                "is_uncertain": True,
+            },
+        ),
+        recent_events=(
+            {"object_type": "pedestrian_signal", "event_type": "changed", "seconds_ago": 2},
+            {"object_type": "bus", "event_type": "appeared", "seconds_ago": 1},
+        ),
+        latest_narrations=(),
+        updated_at_ms=1,
+        scene_confidence=0.9,
+        raw_detections=(
+            {
+                "class_name": "traffic light",
+                "confidence": 0.62,
+                "bbox_xyxy": [1.0, 1.0, 5.0, 8.0],
+                "track_id": 3,
+                "direction": "중앙",
+                "distance": "멀리",
+                "size_percent": 1.2,
+            },
+            {
+                "class_name": "bus",
+                "confidence": 0.9,
+                "bbox_xyxy": [10.0, 2.0, 20.0, 12.0],
+                "track_id": 7,
+                "direction": "오른쪽",
+                "distance": "중간",
+                "size_percent": 20.8,
+            },
+        ),
+    )
+
+
+def test_tool_get_current_scene_returns_raw_detections() -> None:
+    from vision_agent.server import _tool_get_current_scene
+
+    result = _tool_get_current_scene(_raw_snapshot())
+
+    assert result["object_count"] == 2
+    assert result["detected_at_ms"] == 1
+    assert result["seconds_since_detection"] >= 0
+    bus = result["detected_objects"][1]
+    assert bus["class_name"] == "bus"
+    assert bus["bbox_xyxy"] == [10.0, 2.0, 20.0, 12.0]
+    assert bus["track_id"] == 7
+
+
+def test_tool_find_object_matches_korean_alias() -> None:
+    from vision_agent.server import _tool_find_object
+
+    found = _tool_find_object(_raw_snapshot(), "버스")
+    assert found["found"] is True
+    assert found["matches"][0]["class_name"] == "bus"
+    assert found["matches"][0]["direction"] == "오른쪽"
+    assert found["matches"][0]["size_percent"] == 20.8
+    assert found["matches"][0]["confidence"] == 0.9
+
+    missing = _tool_find_object(_raw_snapshot(), "kiosk")
+    assert missing["found"] is False
+    assert missing["matches"] == []
+
+    invalid = _tool_find_object(_raw_snapshot(), "   ")
+    assert invalid == {"error": "name_required"}
+
+
+def test_tool_check_traffic_light_reports_state_and_confidence() -> None:
+    from vision_agent.server import _tool_check_traffic_light
+
+    result = _tool_check_traffic_light(_raw_snapshot())
+
+    assert result["traffic_light_visible"] is True
+    assert result["state"] == "GREEN"
+    assert result["is_uncertain"] is True
+    assert result["detection_confidence"] == 0.62
+    assert result["last_update_ms"] == 1
+    assert [event["object_type"] for event in result["recent_signal_events"]] == [
+        "pedestrian_signal"
+    ]
+
+
+def test_tool_check_traffic_light_when_no_signal() -> None:
+    from vision_agent.server import _tool_check_traffic_light
+
+    empty = SceneSnapshot(
+        session_id="s",
+        visible_objects=(),
+        recent_events=(),
+        latest_narrations=(),
+        updated_at_ms=None,
+    )
+
+    result = _tool_check_traffic_light(empty)
+
+    assert result["traffic_light_visible"] is False
+    assert result["state"] == "UNKNOWN"
+    assert result["detection_confidence"] is None
+
+
+class _FakeToolChatClient(_FakeChatClient):
+    """Fake that exercises every server tool through the executor."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tool_results: dict[str, object] = {}
+
+    def create_tool_answer(
+        self,
+        scene_state: Mapping[str, object],
+        user_question: str,
+        execute_tool,
+    ) -> tuple[str, list[dict[str, object]]]:
+        self.calls.append((dict(scene_state), user_question))
+        self.tool_results = {
+            "scene": execute_tool("get_current_scene", {}),
+            "find": execute_tool("find_object", {"name": "버스"}),
+            "light": execute_tool("check_traffic_light", {}),
+            "vlm": execute_tool("analyze_frame_with_vlm", {"question": "길 상태는?"}),
+            "unknown": execute_tool("bogus_tool", {}),
+        }
+        return "툴 기반 답변입니다.", [
+            {"name": "get_current_scene", "latency_ms": 1.0},
+            {"name": "analyze_frame_with_vlm", "latency_ms": 2.0},
+        ]
+
+
+def test_chat_prefers_tool_calling_path_and_executes_server_tools() -> None:
+    chat_client = _FakeToolChatClient()
+    app = create_app(
+        _test_config(),
+        lambda: _FakeRichSession(),
+        chat_client_factory=lambda: chat_client,
+    )
+
+    with TestClient(app) as client:
+        _stream_one_frame(client, "tool-session")
+        response = client.post(
+            "/api/chat",
+            json={"session_id": "tool-session", "user_question": "버스 어디 있어?"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["answer_text"] == "툴 기반 답변입니다."
+    assert [call["name"] for call in payload["tool_calls"]] == [
+        "get_current_scene",
+        "analyze_frame_with_vlm",
+    ]
+    # analyze_frame_with_vlm ran through the ring buffer + vision client.
+    assert payload["vlm"]["used"] is True
+    assert payload["vlm"]["reason"] == "tool_call"
+    assert chat_client.tool_results["vlm"] == {"vlm_answer": "이미지 기반 답변입니다."}
+    assert len(chat_client.vision_calls) == 1
+
+    scene = chat_client.tool_results["scene"]
+    assert scene["object_count"] == 7  # raw keeps every detection
+    find = chat_client.tool_results["find"]
+    assert find["found"] is True
+    assert find["matches"][0]["class_name"] == "bus"
+    light = chat_client.tool_results["light"]
+    assert light["state"] == "GREEN"
+    assert chat_client.tool_results["unknown"] == {"error": "unknown_tool:bogus_tool"}
+
+
+def test_vlm_tool_respects_cooldown_and_missing_frames() -> None:
+    chat_client = _FakeToolChatClient()
+    app = create_app(
+        _test_config(vlm_cooldown_s=60.0),
+        lambda: _FakeRichSession(),
+        chat_client_factory=lambda: chat_client,
+    )
+
+    with TestClient(app) as client:
+        # No frames streamed yet: session known via /api/session only.
+        session_id = client.post("/api/session").json()["session_id"]
+        client.post(
+            "/api/chat",
+            json={"session_id": session_id, "user_question": "질문"},
+        )
+        assert chat_client.tool_results["vlm"] == {"error": "no_recent_frame"}
+
+        _stream_one_frame(client, "cooldown-session")
+        client.post(
+            "/api/chat",
+            json={"session_id": "cooldown-session", "user_question": "질문"},
+        )
+        assert chat_client.tool_results["vlm"] == {"vlm_answer": "이미지 기반 답변입니다."}
+
+        client.post(
+            "/api/chat",
+            json={"session_id": "cooldown-session", "user_question": "질문"},
+        )
+        assert chat_client.tool_results["vlm"]["error"] == "cooldown_active"
+        assert chat_client.tool_results["vlm"]["retry_after_s"] > 0

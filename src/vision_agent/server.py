@@ -662,23 +662,25 @@ def _serialized_visible_objects(
     analysis: object,
     frame_width: int,
     frame_height: int,
-) -> tuple[list[dict[str, object]], float | None]:
+) -> tuple[list[dict[str, object]], float | None, list[dict[str, object]]]:
     """Summarize what is currently visible for the chat scene state.
 
     Unlike ``analysis_events`` (state changes only), this reflects every
     detection in the latest frame, enriched with analyzer state and confirmed
     OCR text but stripped of internal debug attributes. Also returns the best
-    detection confidence of the kept objects so the VLM fallback can judge
-    scene quality without exposing raw numbers to the chat model.
+    detection confidence of the kept objects (for the VLM fallback) and the
+    full raw detection list (bbox, track id, raw confidence) for the chat
+    tools — neither of which is sent to the chat model directly.
     """
     detections = getattr(analysis, "detections", ())
     if not isinstance(detections, Sequence) or isinstance(detections, (str, bytes, bytearray)):
-        return [], None
+        return [], None, []
     results_by_index = getattr(analysis, "analysis_results_by_index", {})
     if not isinstance(results_by_index, Mapping):
         results_by_index = {}
 
     objects: list[tuple[int, bool, float, dict[str, object]]] = []
+    raw_detections: list[dict[str, object]] = []
     for index, detection in enumerate(detections):
         object_type = str(getattr(detection, "class_name", "")).strip()
         if not object_type:
@@ -686,6 +688,11 @@ def _serialized_visible_objects(
         entry: dict[str, object] = {"object_type": object_type}
         confidence = _finite_number(getattr(detection, "confidence", None))
 
+        position: str | None = None
+        distance: str | None = None
+        bbox: list[float] | None = None
+        size_percent: float | None = None
+        left = right = top = bottom = None
         xyxy = getattr(detection, "xyxy", None)
         if (
             frame_width > 0
@@ -697,23 +704,14 @@ def _serialized_visible_objects(
             right = _finite_number(xyxy[2])
             top = _finite_number(xyxy[1])
             bottom = _finite_number(xyxy[3])
-            # A "person" whose box starts low in the frame and runs off the
-            # bottom edge is the user's own feet/legs entering the shot, not
-            # someone standing in front (a real close person shows a head in
-            # the upper half). Reporting it caused "앞에 사람이 있어요".
-            if (
-                object_type.lower() == "person"
-                and top is not None
-                and bottom is not None
-                and frame_height > 0
-                and top >= frame_height * 0.55
-                and bottom >= frame_height * 0.95
-            ):
-                continue
             if left is not None and right is not None:
+                bbox = [
+                    round(left, 1),
+                    round(top, 1) if top is not None else 0.0,
+                    round(right, 1),
+                    round(bottom, 1) if bottom is not None else 0.0,
+                ]
                 position = _position_label(left, right, frame_width)
-                if position is not None:
-                    entry["position"] = position
                 if top is not None and bottom is not None:
                     distance = _distance_label(
                         left,
@@ -723,13 +721,53 @@ def _serialized_visible_objects(
                         frame_width,
                         frame_height,
                     )
-                    if distance is not None:
-                        entry["distance"] = distance
+                    if frame_height > 0:
+                        size_percent = round(
+                            max(0.0, right - left)
+                            * max(0.0, bottom - top)
+                            / (frame_width * frame_height)
+                            * 100.0,
+                            1,
+                        )
                     # A frame-wide but not-close box (a train or bridge in
                     # the background) does not block the path; "전방 전체"
                     # is reserved for objects the user could walk into.
-                    if entry.get("position") == "전방 전체" and distance != "가까움":
-                        entry["position"] = "중앙"
+                    if position == "전방 전체" and distance != "가까움":
+                        position = "중앙"
+
+        raw_entry: dict[str, object] = {"class_name": object_type}
+        if confidence is not None:
+            raw_entry["confidence"] = round(confidence, 3)
+        if bbox is not None:
+            raw_entry["bbox_xyxy"] = bbox
+        track_id = getattr(detection, "track_id", None)
+        if isinstance(track_id, int) and not isinstance(track_id, bool):
+            raw_entry["track_id"] = track_id
+        if position is not None:
+            raw_entry["direction"] = position
+        if distance is not None:
+            raw_entry["distance"] = distance
+        if size_percent is not None:
+            raw_entry["size_percent"] = size_percent
+        raw_detections.append(raw_entry)
+
+        # A "person" whose box starts low in the frame and runs off the
+        # bottom edge is the user's own feet/legs entering the shot, not
+        # someone standing in front (a real close person shows a head in
+        # the upper half). Reporting it caused "앞에 사람이 있어요".
+        if (
+            object_type.lower() == "person"
+            and top is not None
+            and bottom is not None
+            and frame_height > 0
+            and top >= frame_height * 0.55
+            and bottom >= frame_height * 0.95
+        ):
+            continue
+        if position is not None:
+            entry["position"] = position
+        if distance is not None:
+            entry["distance"] = distance
 
         result = results_by_index.get(index)
         if result is not None:
@@ -775,7 +813,114 @@ def _serialized_visible_objects(
     objects.sort(key=lambda item: item[:3], reverse=True)
     kept = objects[:_MAX_VISIBLE_OBJECTS]
     scene_confidence = max((confidence for _, _, confidence, _ in kept), default=None)
-    return [entry for _, _, _, entry in kept], scene_confidence
+    return [entry for _, _, _, entry in kept], scene_confidence, raw_detections
+
+
+# Korean aliases so find_object("버스") works without the model translating.
+_OBJECT_NAME_ALIASES = {
+    "사람": "person",
+    "버스": "bus",
+    "자동차": "car",
+    "차": "car",
+    "트럭": "truck",
+    "자전거": "bicycle",
+    "오토바이": "motorcycle",
+    "신호등": "traffic_light",
+    "보행자신호": "pedestrian_signal",
+    "표지판": "traffic_sign",
+    "볼라드": "bollard",
+    "나무": "tree_trunk",
+    "가로수": "tree_trunk",
+    "기둥": "pole",
+    "전봇대": "pole",
+    "의자": "chair",
+    "벤치": "bench",
+    "키오스크": "kiosk",
+    "휠체어": "wheelchair",
+    "유모차": "stroller",
+    "소화전": "fire_hydrant",
+    "입간판": "movable_signage",
+    "간판": "movable_signage",
+}
+
+
+def _normalize_object_name(name: str) -> str:
+    normalized = name.strip().lower().replace(" ", "_")
+    return _OBJECT_NAME_ALIASES.get(name.strip(), normalized)
+
+
+def _seconds_since(updated_at_ms: int | None) -> float | None:
+    if updated_at_ms is None:
+        return None
+    now_ms = time.time_ns() // 1_000_000
+    return max(0.0, round((now_ms - updated_at_ms) / 1000.0, 1))
+
+
+def _tool_get_current_scene(snapshot: SceneSnapshot) -> dict[str, object]:
+    """Chat tool: full latest-frame YOLO detections with metadata."""
+    return {
+        "detected_objects": [dict(item) for item in snapshot.raw_detections],
+        "object_count": len(snapshot.raw_detections),
+        "detected_at_ms": snapshot.updated_at_ms,
+        "seconds_since_detection": _seconds_since(snapshot.updated_at_ms),
+    }
+
+
+def _tool_find_object(snapshot: SceneSnapshot, name: str) -> dict[str, object]:
+    """Chat tool: whether a specific object class is currently visible."""
+    query = _normalize_object_name(name)
+    if not query:
+        return {"error": "name_required"}
+    matches = []
+    for item in snapshot.raw_detections:
+        class_name = str(item.get("class_name", "")).strip().lower().replace(" ", "_")
+        if query == class_name or query in class_name or class_name in query:
+            match: dict[str, object] = {"class_name": item.get("class_name")}
+            for key in ("direction", "distance", "size_percent", "confidence", "track_id"):
+                if key in item:
+                    match[key] = item[key]
+            matches.append(match)
+    return {
+        "query": name,
+        "found": bool(matches),
+        "matches": matches,
+        "seconds_since_detection": _seconds_since(snapshot.updated_at_ms),
+    }
+
+
+def _tool_check_traffic_light(snapshot: SceneSnapshot) -> dict[str, object]:
+    """Chat tool: current signal state, judgement confidence, last update."""
+
+    def _is_signal(type_name: object) -> bool:
+        normalized = str(type_name).strip().lower().replace(" ", "_")
+        return "signal" in normalized or "traffic_light" in normalized
+
+    visible = [item for item in snapshot.visible_objects if _is_signal(item.get("object_type"))]
+    raw = [item for item in snapshot.raw_detections if _is_signal(item.get("class_name"))]
+    state = None
+    is_uncertain = False
+    for item in visible:
+        if "state" in item:
+            state = item["state"]
+            is_uncertain = bool(item.get("is_uncertain", False))
+            break
+    confidences = [
+        float(item["confidence"])
+        for item in raw
+        if isinstance(item.get("confidence"), (int, float))
+    ]
+    signal_events = [
+        dict(event) for event in snapshot.recent_events if _is_signal(event.get("object_type", ""))
+    ]
+    return {
+        "traffic_light_visible": bool(visible or raw),
+        "state": state if state is not None else "UNKNOWN",
+        "is_uncertain": is_uncertain,
+        "detection_confidence": max(confidences) if confidences else None,
+        "last_update_ms": snapshot.updated_at_ms,
+        "seconds_since_update": _seconds_since(snapshot.updated_at_ms),
+        "recent_signal_events": signal_events,
+    }
 
 
 _VLM_DETAIL_KEYWORDS = ("자세히", "상세", "구체적", "묘사")
@@ -1033,6 +1178,60 @@ def create_app(
 
         trigger = _vlm_trigger_reason(snapshot, question, server_config)
         vlm_meta: dict[str, object] = {"used": False, "reason": None, "latency_ms": None}
+        tool_calls_meta: list[dict[str, object]] = []
+
+        def run_vlm_tool(tool_client: "ChatClientProtocol", vlm_question: str) -> dict[str, object]:
+            """analyze_frame_with_vlm tool body; runs inside the tool thread."""
+            create_vision = getattr(tool_client, "create_vision_answer", None)
+            if not callable(create_vision):
+                return {"error": "vlm_unavailable"}
+            if not server_config.vlm_fallback_enabled:
+                return {"error": "vlm_disabled"}
+            now_s = time.monotonic()
+            last_called_s = vlm_last_called.get(session_id)
+            if last_called_s is not None and now_s - last_called_s < server_config.vlm_cooldown_s:
+                return {
+                    "error": "cooldown_active",
+                    "retry_after_s": round(
+                        server_config.vlm_cooldown_s - (now_s - last_called_s),
+                        1,
+                    ),
+                }
+            frames = frame_buffer.recent(
+                session_id,
+                max_age_ms=int(server_config.frame_buffer_max_age_s * 1000.0),
+            )
+            if not frames:
+                return {"error": "no_recent_frame"}
+            image = _select_vlm_image(frames, server_config)
+            if image is None:
+                return {"error": "no_usable_frame"}
+            # Stamp before calling so failures also respect the cooldown.
+            vlm_last_called[session_id] = now_s
+            started_s = time.perf_counter()
+            try:
+                answer = create_vision(scene_state, vlm_question, image)
+            except ChatServiceError as exc:
+                LOGGER.warning("vlm tool failed code=%s", exc.code)
+                return {"error": f"vlm_failed:{exc.code}"}
+            latency_ms = round((time.perf_counter() - started_s) * 1000.0, 1)
+            vlm_meta.update({"used": True, "reason": "tool_call", "latency_ms": latency_ms})
+            return {"vlm_answer": answer}
+
+        def make_tool_executor(tool_client: "ChatClientProtocol"):
+            def execute_tool(name: str, arguments: Mapping[str, object]) -> object:
+                if name == "get_current_scene":
+                    return _tool_get_current_scene(snapshot)
+                if name == "find_object":
+                    return _tool_find_object(snapshot, str(arguments.get("name", "")))
+                if name == "check_traffic_light":
+                    return _tool_check_traffic_light(snapshot)
+                if name == "analyze_frame_with_vlm":
+                    vlm_question = str(arguments.get("question", "")).strip() or question
+                    return run_vlm_tool(tool_client, vlm_question)
+                return {"error": f"unknown_tool:{name}"}
+
+            return execute_tool
 
         async def try_vlm_answer(vlm_client: "ChatClientProtocol") -> str | None:
             """Attempt the vision fallback; on any miss record why and return None."""
@@ -1076,10 +1275,30 @@ def create_app(
         try:
             client = await _chat_client()
             answer_text: str | None = None
-            if trigger is not None:
-                answer_text = await try_vlm_answer(client)
-            if answer_text is None:
-                answer_text = await asyncio.to_thread(client.create_answer, scene_state, question)
+            create_tool = getattr(client, "create_tool_answer", None)
+            if callable(create_tool):
+                # Tool-calling path: Grok decides which scene tools to call.
+                answer_text, tool_calls_meta = await asyncio.to_thread(
+                    create_tool,
+                    scene_state,
+                    question,
+                    make_tool_executor(client),
+                )
+                if tool_calls_meta:
+                    LOGGER.info(
+                        "chat tools used=%s",
+                        [call["name"] for call in tool_calls_meta],
+                    )
+            else:
+                # Legacy path for injected clients without tool support.
+                if trigger is not None:
+                    answer_text = await try_vlm_answer(client)
+                if answer_text is None:
+                    answer_text = await asyncio.to_thread(
+                        client.create_answer,
+                        scene_state,
+                        question,
+                    )
         except ChatServiceError as exc:
             # Configuration problems are the operator's to fix (503); the rest
             # are upstream failures (502). The connection must survive both.
@@ -1104,6 +1323,7 @@ def create_app(
                 "has_scene_analysis": snapshot.has_analysis,
                 "scene_state_updated_at_ms": snapshot.updated_at_ms,
                 "vlm": vlm_meta,
+                "tool_calls": tool_calls_meta,
             }
         )
 
@@ -1208,7 +1428,7 @@ def create_app(
                         getattr(analysis, "narrations", ())
                     )
                     completed_at_ms = time.time_ns() // 1_000_000
-                    visible_objects, scene_confidence = _serialized_visible_objects(
+                    visible_objects, scene_confidence, raw_detections = _serialized_visible_objects(
                         analysis,
                         outcome.frame_width,
                         outcome.frame_height,
@@ -1219,6 +1439,7 @@ def create_app(
                         narrations=serialized_narrations,
                         visible_objects=visible_objects,
                         scene_confidence=scene_confidence,
+                        raw_detections=raw_detections,
                         updated_at_ms=completed_at_ms,
                     )
                     response: dict[str, object] = {
