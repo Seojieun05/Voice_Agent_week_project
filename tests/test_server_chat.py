@@ -196,6 +196,8 @@ class _FakeRichSession:
                 _FakeDetection("bus", 0.9, (16.0, 0.0, 24.0, 10.0)),
                 _FakeDetection("traffic light", 0.5, (0.0, 0.0, 8.0, 10.0)),
                 _FakeDetection("person", 0.95, (8.0, 0.0, 16.0, 10.0)),
+                _FakeDetection("person", 0.4, (0.0, 0.0, 8.0, 10.0)),
+                _FakeDetection("chair", 0.2, (8.0, 0.0, 16.0, 10.0)),
             ],
             analysis_results_by_index={
                 0: _FakeResult("bus", attributes={"route_number": "146"}),
@@ -239,28 +241,31 @@ def test_chat_scene_state_includes_visible_objects_with_text_and_position() -> N
 
     assert response.status_code == 200
     scene_state, _question = chat_client.calls[0]
-    # Objects with state or readable text come first; internal debug
-    # attributes never reach the chat scene state.
+    # Importance-ordered (signal > vehicle > person), no raw confidence
+    # numbers, weak unconfirmed detections flagged or dropped entirely.
     assert scene_state["visible_objects"] == [
         {
-            "object_type": "bus",
-            "confidence": 0.9,
-            "position": "오른쪽",
-            "text": "146",
-        },
-        {
             "object_type": "pedestrian_signal",
-            "confidence": 0.5,
             "position": "왼쪽",
             "state": "GREEN",
             "is_uncertain": True,
         },
         {
+            "object_type": "bus",
+            "position": "오른쪽",
+            "text": "146",
+        },
+        {
             "object_type": "person",
-            "confidence": 0.95,
             "position": "중앙",
         },
+        {
+            "object_type": "person",
+            "position": "왼쪽",
+            "is_uncertain": True,
+        },
     ]
+    assert scene_state["seconds_since_last_frame"] >= 0
     # The WebSocket response format is unchanged by the chat feature.
     assert "visible_objects" not in analysis_response
 

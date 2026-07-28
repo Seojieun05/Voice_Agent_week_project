@@ -528,6 +528,25 @@ def _serialized_narrations(raw_narrations: object) -> list[str]:
 
 
 _MAX_VISIBLE_OBJECTS = 12
+# Weak detections without analyzer confirmation are noise for the chat AI.
+_MIN_VISIBLE_CONFIDENCE = 0.30
+# Below this, an unconfirmed detection is flagged so answers can hedge once.
+_UNCERTAIN_VISIBLE_CONFIDENCE = 0.50
+
+
+def _visible_object_importance(object_type: str) -> int:
+    """Rank object types by how much they matter to a walking pedestrian."""
+    normalized = object_type.strip().lower().replace(" ", "_")
+    if "signal" in normalized or "traffic_light" in normalized:
+        return 5
+    if normalized in {"bus", "car", "truck", "van", "motorcycle", "train"}:
+        return 4
+    if normalized in {"person", "bicycle", "wheelchair", "stroller", "dog"}:
+        return 3
+    for marker in ("kiosk", "sign", "screen", "panel", "text", "door", "stairs"):
+        if marker in normalized:
+            return 2
+    return 1
 
 
 def _visible_object_text(attributes: Mapping[str, object]) -> str | None:
@@ -561,15 +580,13 @@ def _serialized_visible_objects(analysis: object, frame_width: int) -> list[dict
     if not isinstance(results_by_index, Mapping):
         results_by_index = {}
 
-    objects: list[dict[str, object]] = []
+    objects: list[tuple[int, bool, float, dict[str, object]]] = []
     for index, detection in enumerate(detections):
         object_type = str(getattr(detection, "class_name", "")).strip()
         if not object_type:
             continue
         entry: dict[str, object] = {"object_type": object_type}
         confidence = _finite_number(getattr(detection, "confidence", None))
-        if confidence is not None:
-            entry["confidence"] = round(confidence, 3)
 
         xyxy = getattr(detection, "xyxy", None)
         if (
@@ -606,15 +623,23 @@ def _serialized_visible_objects(analysis: object, frame_width: int) -> list[dict
                 text = _visible_object_text(attributes)
                 if text is not None:
                     entry["text"] = text
-        objects.append(entry)
 
-    # Objects with analyzer state or readable text matter most to the user;
-    # keep them first so truncation drops only low-signal detections.
-    objects.sort(
-        key=lambda item: ("state" in item or "text" in item, item.get("confidence", 0.0)),
-        reverse=True,
-    )
-    return objects[:_MAX_VISIBLE_OBJECTS]
+        confirmed = "state" in entry or "text" in entry
+        # Raw confidence numbers push the chat model into hedging every
+        # sentence; keep only a boolean flag for genuinely weak detections
+        # and drop unconfirmed noise entirely.
+        if not confirmed and confidence is not None:
+            if confidence < _MIN_VISIBLE_CONFIDENCE:
+                continue
+            if confidence < _UNCERTAIN_VISIBLE_CONFIDENCE:
+                entry["is_uncertain"] = True
+        importance = _visible_object_importance(str(entry["object_type"]))
+        objects.append((importance, confirmed, confidence or 0.0, entry))
+
+    # Importance-first ordering: the first entry is the one the answer
+    # should describe in detail, and truncation drops only low-signal items.
+    objects.sort(key=lambda item: item[:3], reverse=True)
+    return [entry for _, _, _, entry in objects[:_MAX_VISIBLE_OBJECTS]]
 
 
 def _safe_timings(analysis: object) -> dict[str, float]:
@@ -743,6 +768,12 @@ def create_app(
             )
 
         scene_state = snapshot.to_dict()
+        if snapshot.updated_at_ms is not None:
+            now_ms = time.time_ns() // 1_000_000
+            scene_state["seconds_since_last_frame"] = max(
+                0,
+                round((now_ms - snapshot.updated_at_ms) / 1000.0),
+            )
         try:
             client = await _chat_client()
             answer_text = await asyncio.to_thread(client.create_answer, scene_state, question)

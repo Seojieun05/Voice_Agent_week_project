@@ -47,8 +47,10 @@ class _SessionState:
 
     def __init__(self, max_recent_events: int, max_narrations: int) -> None:
         self.visible_objects: tuple[dict[str, object], ...] = ()
-        self.recent_events: deque[dict[str, object]] = deque(maxlen=max_recent_events)
-        self.latest_narrations: deque[str] = deque(maxlen=max_narrations)
+        # Events and narrations are stored with the frame time they arrived
+        # at so snapshots can drop entries the camera has since moved past.
+        self.recent_events: deque[tuple[int, dict[str, object]]] = deque(maxlen=max_recent_events)
+        self.latest_narrations: deque[tuple[int, str]] = deque(maxlen=max_narrations)
         self.updated_at_ms: int | None = None
 
 
@@ -65,6 +67,8 @@ class SceneStateStore:
         max_recent_events: int = 20,
         max_narrations: int = 5,
         max_sessions: int = 256,
+        event_ttl_s: float = 10.0,
+        narration_ttl_s: float = 15.0,
     ) -> None:
         if max_recent_events < 1:
             raise ValueError("max_recent_events must be at least 1")
@@ -72,9 +76,15 @@ class SceneStateStore:
             raise ValueError("max_narrations must be at least 1")
         if max_sessions < 1:
             raise ValueError("max_sessions must be at least 1")
+        if event_ttl_s <= 0.0:
+            raise ValueError("event_ttl_s must be positive")
+        if narration_ttl_s <= 0.0:
+            raise ValueError("narration_ttl_s must be positive")
         self._max_recent_events = max_recent_events
         self._max_narrations = max_narrations
         self._max_sessions = max_sessions
+        self._event_ttl_ms = int(event_ttl_s * 1000.0)
+        self._narration_ttl_ms = int(narration_ttl_s * 1000.0)
         self._sessions: OrderedDict[str, _SessionState] = OrderedDict()
         self._lock = threading.Lock()
 
@@ -100,30 +110,53 @@ class SceneStateStore:
         """
         with self._lock:
             state = self._touch(session_id)
+            resolved_at_ms = updated_at_ms if updated_at_ms is not None else _now_ms()
             for event in analysis_events:
                 if isinstance(event, Mapping):
-                    state.recent_events.append(dict(event))
+                    state.recent_events.append((resolved_at_ms, dict(event)))
             for narration in narrations:
                 message = str(narration).strip()
                 if message:
-                    state.latest_narrations.append(message)
+                    state.latest_narrations.append((resolved_at_ms, message))
             if visible_objects is not None:
                 state.visible_objects = tuple(
                     dict(item) for item in visible_objects if isinstance(item, Mapping)
                 )
-            state.updated_at_ms = updated_at_ms if updated_at_ms is not None else _now_ms()
+            state.updated_at_ms = resolved_at_ms
 
     def snapshot(self, session_id: str) -> SceneSnapshot | None:
-        """Return the latest state for a session, or None if it is unknown."""
+        """Return the latest state for a session, or None if it is unknown.
+
+        Events and narrations older than their TTL — measured against the
+        newest frame, not the wall clock — are dropped so a camera that moved
+        on stops reporting objects it saw earlier. Kept events gain a
+        ``seconds_ago`` field so the chat AI can tell past from present.
+        """
         with self._lock:
             state = self._sessions.get(session_id)
             if state is None:
                 return None
+            reference_ms = state.updated_at_ms
+            recent_events: list[dict[str, object]] = []
+            latest_narrations: list[str] = []
+            if reference_ms is not None:
+                for added_at_ms, event in state.recent_events:
+                    age_ms = reference_ms - added_at_ms
+                    if age_ms > self._event_ttl_ms:
+                        continue
+                    aged = dict(event)
+                    aged["seconds_ago"] = max(0, round(age_ms / 1000.0))
+                    recent_events.append(aged)
+                latest_narrations = [
+                    message
+                    for added_at_ms, message in state.latest_narrations
+                    if reference_ms - added_at_ms <= self._narration_ttl_ms
+                ]
             return SceneSnapshot(
                 session_id=session_id,
                 visible_objects=tuple(dict(item) for item in state.visible_objects),
-                recent_events=tuple(dict(event) for event in state.recent_events),
-                latest_narrations=tuple(state.latest_narrations),
+                recent_events=tuple(recent_events),
+                latest_narrations=tuple(latest_narrations),
                 updated_at_ms=state.updated_at_ms,
             )
 

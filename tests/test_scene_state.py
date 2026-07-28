@@ -59,6 +59,36 @@ def test_update_accumulates_across_frames_and_skips_blank_narrations() -> None:
     assert snapshot.updated_at_ms == 2
 
 
+def test_events_and_narrations_expire_relative_to_newest_frame() -> None:
+    store = SceneStateStore(event_ttl_s=10.0, narration_ttl_s=15.0)
+    store.update(
+        "session-a",
+        analysis_events=[{"event_type": "OLD"}],
+        narrations=["old narration"],
+        updated_at_ms=0,
+    )
+    store.update(
+        "session-a",
+        analysis_events=[{"event_type": "RECENT"}],
+        narrations=["recent narration"],
+        updated_at_ms=11_000,
+    )
+
+    snapshot = store.snapshot("session-a")
+
+    assert snapshot is not None
+    assert [event["event_type"] for event in snapshot.recent_events] == ["RECENT"]
+    assert snapshot.recent_events[0]["seconds_ago"] == 0
+    assert snapshot.latest_narrations == ("old narration", "recent narration")
+
+    store.update("session-a", updated_at_ms=16_000)
+    aged = store.snapshot("session-a")
+    assert aged is not None
+    assert [event["event_type"] for event in aged.recent_events] == ["RECENT"]
+    assert aged.recent_events[0]["seconds_ago"] == 5
+    assert aged.latest_narrations == ("recent narration",)
+
+
 def test_visible_objects_replace_previous_frame() -> None:
     store = SceneStateStore()
     store.update(
@@ -135,6 +165,8 @@ def test_sessions_are_evicted_least_recently_updated() -> None:
         {"max_recent_events": 0},
         {"max_narrations": 0},
         {"max_sessions": 0},
+        {"event_ttl_s": 0.0},
+        {"narration_ttl_s": 0.0},
     ],
 )
 def test_store_rejects_invalid_limits(kwargs: dict[str, int]) -> None:
