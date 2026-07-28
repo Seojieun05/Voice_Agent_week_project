@@ -31,6 +31,7 @@ datasets/public_baseline/review/*
 # Environment
 .env
 
-# md
+# ai
 claude.md
 codex.md
+.claude/
