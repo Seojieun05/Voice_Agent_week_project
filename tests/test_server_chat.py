@@ -292,21 +292,25 @@ def test_chat_scene_state_includes_visible_objects_with_text_and_position() -> N
         {
             "object_type": "pedestrian_signal",
             "position": "왼쪽",
+            "distance": "가까움",
             "state": "GREEN",
             "is_uncertain": True,
         },
         {
             "object_type": "bus",
             "position": "오른쪽",
+            "distance": "가까움",
             "text": "146",
         },
         {
             "object_type": "person",
             "position": "중앙",
+            "distance": "가까움",
         },
         {
             "object_type": "person",
             "position": "왼쪽",
+            "distance": "가까움",
             "is_uncertain": True,
         },
     ]
@@ -469,6 +473,8 @@ def _snapshot(
         (({"object_type": "bus"},), 0.9, "버스가 무슨 색이야?", "question_needs_vision"),
         (({"object_type": "sign"},), 0.9, "표지판에 뭐라고 적혀 있어?", "question_needs_vision"),
         (({"object_type": "person"},), 0.9, "자세히 설명해줘", "detail_requested"),
+        (({"object_type": "person"},), 0.9, "앞으로 가도 돼?", "path_check"),
+        (({"object_type": "person"},), 0.9, "지금 건너도 돼?", "path_check"),
         (({"object_type": "person"},), 0.9, "앞에 뭐가 보여?", None),
     ],
 )
@@ -668,3 +674,15 @@ def test_vlm_frame_selection_prefers_sharper_frame_within_window() -> None:
     decoded = cv2.imdecode(np.frombuffer(selected, dtype=np.uint8), cv2.IMREAD_COLOR)
     # Both frames are fresh; the noisy (higher Laplacian variance) one wins.
     assert float(decoded.std()) > 30.0
+
+
+def test_distance_label_scales_with_apparent_size() -> None:
+    from vision_agent.server import _distance_label
+
+    # Far pedestrian: small box relative to the frame.
+    assert _distance_label(45.0, 55.0, 40.0, 55.0, 100, 100) == "멀리"
+    # Mid-distance: about a third of the frame height.
+    assert _distance_label(40.0, 60.0, 30.0, 65.0, 100, 100) == "중간"
+    # Close obstacle: fills most of the frame height.
+    assert _distance_label(20.0, 80.0, 10.0, 90.0, 100, 100) == "가까움"
+    assert _distance_label(0.0, 10.0, 0.0, 10.0, 0, 100) is None

@@ -99,7 +99,7 @@
 
 서버는 프레임을 처리할 때마다 해당 세션의 장면 상태를 내부 저장소에 보관하며, 이것이 `/api/chat` 답변의 근거가 된다:
 
-- `visible_objects`: 마지막 프레임에 실제로 보인 물체 요약(종류, 위치 왼쪽/중앙/오른쪽, 신호 상태, OCR로 읽은 글자 — 버스 번호·표지판·키오스크 문구). 매 프레임 교체되며 중요도 순(신호등 > 차량 > 사람 > 표지판·키오스크)으로 정렬된다. 신뢰도가 매우 낮은 감지는 제외되고, 애매한 감지는 `is_uncertain`으로만 표시된다.
+- `visible_objects`: 마지막 프레임에 실제로 보인 물체 요약(종류, 위치 왼쪽/중앙/오른쪽/전방 전체, 거리 가까움/중간/멀리, 신호 상태, OCR로 읽은 글자 — 버스 번호·표지판·키오스크 문구). 매 프레임 교체되며 중요도 순(신호등 > 차량 > 사람 > 표지판·키오스크)으로 정렬된다. 신뢰도가 매우 낮은 감지는 제외되고, 애매한 감지는 `is_uncertain`으로만 표시된다.
 - `analysis_events`/`narrations`: 최근 상태 변화 이벤트와 안내 문장. 개수 제한과 함께 최신 프레임 기준 TTL(이벤트 5초, 안내 8초)이 적용되어 카메라가 지나친 물체는 답변 근거에서 사라진다. 이벤트에는 `seconds_ago`(몇 초 전)가 붙는다.
 
 서버는 질문을 자주 나오는 유형(진행 가능 여부, 횡단 가능 여부, 글자 읽기, 물체 위치, 장면 설명)으로 분류해 유형별 답변 템플릿을 적용한다. 예: "앞으로 가도 돼?"는 '네/아니요'로 시작하는 답을 받는다. VLM 프레임 선택은 최신 프레임 기준 1.5초 이내의 프레임만 후보로 사용해 과거 장면이 답변에 쓰이지 않게 한다.
@@ -134,7 +134,7 @@
 - `answer_text`: 앱이 TTS로 읽어줄 한국어 문장.
 - `has_scene_analysis`: 이 세션에서 분석된 프레임이 하나라도 있었는지. `false`면 장면 근거 없이 답한 것이다.
 - `scene_state_updated_at_ms`: 답변에 사용된 장면 상태의 마지막 갱신 시각. 앱은 이 값이 오래됐으면(예: 5초 이상) 사용자에게 알릴 수 있다.
-- `vlm`: Grok Vision fallback 메타데이터. YOLO 결과만으로 부족할 때(감지 없음·낮은 신뢰도·색/글자 등 시각 질문·상세 설명 요청) 서버가 최근 프레임 1장을 Grok Vision에 함께 보낸다. `used`가 true면 `reason`은 트리거 사유(`no_detections`/`low_confidence`/`question_needs_vision`/`detail_requested`), `latency_ms`는 VLM 호출 소요 시간. false면 `reason`에 미사용/실패 사유(`cooldown_active`, `no_recent_frame`, `vlm_failed:<code>` 등)가 담기며 답변은 YOLO 장면 정보만으로 생성된 것이다. VLM 실패는 HTTP 에러가 아니라 폴백으로 처리된다.
+- `vlm`: Grok Vision fallback 메타데이터. YOLO 결과만으로 부족할 때(감지 없음·낮은 신뢰도·색/글자 등 시각 질문·상세 설명 요청·진행/횡단 판단) 서버가 최근 프레임 1장을 Grok Vision에 함께 보낸다. `used`가 true면 `reason`은 트리거 사유(`no_detections`/`low_confidence`/`question_needs_vision`/`detail_requested`/`path_check`), `latency_ms`는 VLM 호출 소요 시간. false면 `reason`에 미사용/실패 사유(`cooldown_active`, `no_recent_frame`, `vlm_failed:<code>` 등)가 담기며 답변은 YOLO 장면 정보만으로 생성된 것이다. VLM 실패는 HTTP 에러가 아니라 폴백으로 처리된다.
 
 에러:
 

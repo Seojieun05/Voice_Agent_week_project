@@ -237,6 +237,7 @@ class _FrameOutcome:
     error_message: str | None = None
     process_invoked: bool = False
     frame_width: int = 0
+    frame_height: int = 0
 
 
 @dataclass(slots=True)
@@ -528,6 +529,7 @@ def _process_pending_frame(
         completed_at_s=time.perf_counter(),
         process_invoked=True,
         frame_width=width,
+        frame_height=height,
     )
 
 
@@ -625,9 +627,37 @@ def _position_label(left: float, right: float, frame_width: int) -> str | None:
     return max(overlaps, key=overlaps.__getitem__)
 
 
+def _distance_label(
+    left: float,
+    right: float,
+    top: float,
+    bottom: float,
+    frame_width: int,
+    frame_height: int,
+) -> str | None:
+    """Estimate proximity from how much of the frame the object fills.
+
+    A far-away pedestrian occupies a small box and must not read as an
+    obstacle; a nearby one fills much of the frame height.
+    """
+    if frame_width <= 0 or frame_height <= 0:
+        return None
+    height_ratio = max(0.0, bottom - top) / frame_height
+    width_ratio = max(0.0, right - left) / frame_width
+    if height_ratio <= 0.0 or width_ratio <= 0.0:
+        return None
+    area_ratio = height_ratio * width_ratio
+    if height_ratio >= 0.5 or area_ratio >= 0.25:
+        return "가까움"
+    if height_ratio >= 0.25 or area_ratio >= 0.10:
+        return "중간"
+    return "멀리"
+
+
 def _serialized_visible_objects(
     analysis: object,
     frame_width: int,
+    frame_height: int,
 ) -> tuple[list[dict[str, object]], float | None]:
     """Summarize what is currently visible for the chat scene state.
 
@@ -661,10 +691,23 @@ def _serialized_visible_objects(
         ):
             left = _finite_number(xyxy[0])
             right = _finite_number(xyxy[2])
+            top = _finite_number(xyxy[1])
+            bottom = _finite_number(xyxy[3])
             if left is not None and right is not None:
                 position = _position_label(left, right, frame_width)
                 if position is not None:
                     entry["position"] = position
+                if top is not None and bottom is not None:
+                    distance = _distance_label(
+                        left,
+                        right,
+                        top,
+                        bottom,
+                        frame_width,
+                        frame_height,
+                    )
+                    if distance is not None:
+                        entry["distance"] = distance
 
         result = results_by_index.get(index)
         if result is not None:
@@ -744,6 +787,12 @@ def _vlm_trigger_reason(
         return "question_needs_vision"
     if any(keyword in question for keyword in _VLM_DETAIL_KEYWORDS):
         return "detail_requested"
+    # Go/no-go and crossing judgments need the image: path/sidewalk presence
+    # and signal countdown digits are not in the YOLO object list.
+    from .chat import classify_question
+
+    if classify_question(question) in {"can_i_go", "crossing"}:
+        return "path_check"
     return None
 
 
@@ -1122,6 +1171,7 @@ def create_app(
                     visible_objects, scene_confidence = _serialized_visible_objects(
                         analysis,
                         outcome.frame_width,
+                        outcome.frame_height,
                     )
                     store.update(
                         vision_session_id,
