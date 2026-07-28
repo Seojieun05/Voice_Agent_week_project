@@ -8,6 +8,7 @@ import pytest
 from vision_agent.chat import (
     DEFAULT_GROK_MODEL,
     SYSTEM_PROMPT,
+    VISION_SYSTEM_PROMPT,
     ChatServiceError,
     GrokChatClient,
     GrokConfig,
@@ -28,8 +29,8 @@ SCENE_STATE = {
 }
 
 
-def _client(handler) -> GrokChatClient:
-    config = GrokConfig(api_key="test-key", base_url="https://grok.test/v1")
+def _client(handler, **config_overrides) -> GrokChatClient:
+    config = GrokConfig(api_key="test-key", base_url="https://grok.test/v1", **config_overrides)
     return GrokChatClient(config, transport=httpx.MockTransport(handler))
 
 
@@ -128,6 +129,90 @@ def test_create_answer_rejects_empty_answers() -> None:
     assert excinfo.value.code == "EMPTY_ANSWER"
 
 
+def test_create_vision_answer_attaches_image_and_uses_vision_model() -> None:
+    captured: dict[str, object] = {}
+    jpeg = b"\xff\xd8fake-jpeg-bytes"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return _answer_response("빨간색 문이 보입니다.")
+
+    client = _client(handler, vision_model="grok-vision-test")
+    answer = client.create_vision_answer(SCENE_STATE, "문이 무슨 색이야?", jpeg)
+
+    assert answer == "빨간색 문이 보입니다."
+    body = captured["body"]
+    assert body["model"] == "grok-vision-test"
+    assert body["messages"][0] == {"role": "system", "content": VISION_SYSTEM_PROMPT}
+    content = body["messages"][1]["content"]
+    text_part = content[0]
+    payload = json.loads(text_part["text"])
+    assert payload["scene_state"] == SCENE_STATE
+    assert payload["user_question"] == "문이 무슨 색이야?"
+    image_part = content[1]
+    expected_b64 = __import__("base64").b64encode(jpeg).decode("ascii")
+    assert image_part["image_url"]["url"] == f"data:image/jpeg;base64,{expected_b64}"
+
+
+def test_create_vision_answer_falls_back_to_text_model_name() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return _answer_response("답변")
+
+    _client(handler).create_vision_answer(SCENE_STATE, "질문", b"jpeg")
+
+    assert captured["body"]["model"] == DEFAULT_GROK_MODEL
+
+
+def test_create_vision_answer_retries_transient_failures_once() -> None:
+    attempts: list[int] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        if len(attempts) == 1:
+            return httpx.Response(503, json={"error": "overloaded"})
+        return _answer_response("복구된 답변")
+
+    answer = _client(handler, vision_max_retries=1).create_vision_answer(
+        SCENE_STATE,
+        "질문",
+        b"jpeg",
+    )
+
+    assert answer == "복구된 답변"
+    assert len(attempts) == 2
+
+
+def test_create_vision_answer_does_not_retry_client_errors() -> None:
+    attempts: list[int] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        return httpx.Response(400, json={"error": "bad request"})
+
+    with pytest.raises(ChatServiceError) as excinfo:
+        _client(handler, vision_max_retries=2).create_vision_answer(SCENE_STATE, "질문", b"jpeg")
+
+    assert excinfo.value.code == "UPSTREAM_ERROR"
+    assert len(attempts) == 1
+
+
+def test_create_vision_answer_raises_after_retries_exhausted() -> None:
+    attempts: list[int] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        raise httpx.ConnectTimeout("timed out")
+
+    with pytest.raises(ChatServiceError) as excinfo:
+        _client(handler, vision_max_retries=1).create_vision_answer(SCENE_STATE, "질문", b"jpeg")
+
+    assert excinfo.value.code == "UPSTREAM_TIMEOUT"
+    assert len(attempts) == 2
+
+
 def test_config_from_environment_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GROK_API_KEY", raising=False)
     monkeypatch.delenv("XAI_API_KEY", raising=False)
@@ -146,6 +231,9 @@ def test_config_from_environment_reads_key_and_overrides(
     monkeypatch.setenv("GROK_BASE_URL", "https://example.test/v1")
     monkeypatch.setenv("GROK_MODEL", "grok-custom")
     monkeypatch.setenv("GROK_TIMEOUT_S", "5")
+    monkeypatch.setenv("GROK_VISION_MODEL", "grok-vision-custom")
+    monkeypatch.setenv("GROK_VISION_TIMEOUT_S", "12")
+    monkeypatch.setenv("GROK_VISION_MAX_RETRIES", "2")
 
     config = GrokConfig.from_environment()
 
@@ -153,6 +241,9 @@ def test_config_from_environment_reads_key_and_overrides(
     assert config.base_url == "https://example.test/v1"
     assert config.model == "grok-custom"
     assert config.timeout_s == 5.0
+    assert config.resolved_vision_model == "grok-vision-custom"
+    assert config.vision_timeout_s == 12.0
+    assert config.vision_max_retries == 2
 
 
 def test_config_from_environment_accepts_xai_fallback(
@@ -177,6 +268,8 @@ def test_config_from_environment_accepts_xai_fallback(
         ({"api_key": "k", "model": " "}, "model"),
         ({"api_key": "k", "timeout_s": 0.0}, "timeout_s"),
         ({"api_key": "k", "max_tokens": 0}, "max_tokens"),
+        ({"api_key": "k", "vision_timeout_s": 0.0}, "vision_timeout_s"),
+        ({"api_key": "k", "vision_max_retries": -1}, "vision_max_retries"),
     ],
 )
 def test_grok_config_rejects_invalid_values(kwargs: dict[str, object], message: str) -> None:

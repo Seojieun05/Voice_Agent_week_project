@@ -124,13 +124,15 @@
   "session_id": "b81c9f52...",
   "answer_text": "보행자 신호가 초록색으로 감지되었습니다. 다만 주변 차량이나 실제 도로 상황은 직접 확인이 필요합니다.",
   "has_scene_analysis": true,
-  "scene_state_updated_at_ms": 1780000000180
+  "scene_state_updated_at_ms": 1780000000180,
+  "vlm": { "used": false, "reason": null, "latency_ms": null }
 }
 ```
 
 - `answer_text`: 앱이 TTS로 읽어줄 한국어 문장.
 - `has_scene_analysis`: 이 세션에서 분석된 프레임이 하나라도 있었는지. `false`면 장면 근거 없이 답한 것이다.
 - `scene_state_updated_at_ms`: 답변에 사용된 장면 상태의 마지막 갱신 시각. 앱은 이 값이 오래됐으면(예: 5초 이상) 사용자에게 알릴 수 있다.
+- `vlm`: Grok Vision fallback 메타데이터. YOLO 결과만으로 부족할 때(감지 없음·낮은 신뢰도·색/글자 등 시각 질문·상세 설명 요청) 서버가 최근 프레임 1장을 Grok Vision에 함께 보낸다. `used`가 true면 `reason`은 트리거 사유(`no_detections`/`low_confidence`/`question_needs_vision`/`detail_requested`), `latency_ms`는 VLM 호출 소요 시간. false면 `reason`에 미사용/실패 사유(`cooldown_active`, `no_recent_frame`, `vlm_failed:<code>` 등)가 담기며 답변은 YOLO 장면 정보만으로 생성된 것이다. VLM 실패는 HTTP 에러가 아니라 폴백으로 처리된다.
 
 에러:
 
@@ -153,9 +155,21 @@ Grok 호출이 실패해도 서버와 `/ws/vision` 스트림은 계속 동작한
 | --- | --- | --- |
 | `GROK_API_KEY` (또는 `XAI_API_KEY`) | 없음(필수) | Grok API 키. 코드에 하드코딩하지 않는다 |
 | `GROK_BASE_URL` | `https://api.x.ai/v1` | Grok API 베이스 URL |
-| `GROK_MODEL` | `grok-4-fast-non-reasoning` | 사용할 모델 |
-| `GROK_TIMEOUT_S` | `20` | 호출 타임아웃(초) |
+| `GROK_MODEL` | `grok-4-fast-non-reasoning` | 텍스트 답변 모델 |
+| `GROK_TIMEOUT_S` | `20` | 텍스트 호출 타임아웃(초) |
+| `GROK_VISION_MODEL` | (`GROK_MODEL`과 동일) | VLM fallback 모델 |
+| `GROK_VISION_TIMEOUT_S` | `30` | VLM 호출 타임아웃(초) |
+| `GROK_VISION_MAX_RETRIES` | `1` | VLM 일시 오류(타임아웃·5xx) 재시도 횟수 |
 | `VISION_SERVER_MAX_QUESTION_LENGTH` | `500` | 질문 최대 길이 |
+| `VISION_SERVER_VLM_FALLBACK_ENABLED` | `true` | VLM fallback 사용 여부 |
+| `VISION_SERVER_VLM_CONFIDENCE_THRESHOLD` | `0.45` | 이 값 미만이면 VLM 트리거 |
+| `VISION_SERVER_VLM_COOLDOWN_S` | `5` | 세션별 VLM 호출 최소 간격(초) |
+| `VISION_SERVER_VLM_MAX_IMAGE_BYTES` | `1048576` | VLM 전송 이미지 최대 크기 |
+| `VISION_SERVER_VLM_MAX_IMAGE_DIM` | `1024` | VLM 전송 이미지 최대 변 길이(px) |
+| `VISION_SERVER_FRAME_BUFFER_FRAMES` | `5` | 세션별 보관 프레임 수(메모리 전용) |
+| `VISION_SERVER_FRAME_BUFFER_MAX_AGE_S` | `10` | VLM에 쓸 수 있는 프레임 최대 나이(초) |
+
+수신 JPEG는 VLM 선택용 ring buffer(메모리)에만 잠시 보관되며 디스크나 로그에 저장되지 않는다. VLM 호출 시에도 로그에는 사용 여부·사유·지연시간만 남는다.
 
 ## 향후 확장 (아직 미구현)
 

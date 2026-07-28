@@ -8,8 +8,11 @@ import cv2
 import numpy as np
 from fastapi.testclient import TestClient
 
+import pytest
+
 from vision_agent.chat import ChatServiceError
-from vision_agent.server import ServerConfig, create_app
+from vision_agent.scene_state import SceneSnapshot
+from vision_agent.server import ServerConfig, _vlm_trigger_reason, create_app
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +57,9 @@ class _FakeChatClient:
         self.calls: list[tuple[dict[str, object], str]] = []
         self.closed = False
         self.error: ChatServiceError | Exception | None = None
+        self.vision_answer = "이미지 기반 답변입니다."
+        self.vision_calls: list[tuple[dict[str, object], str, bytes]] = []
+        self.vision_error: ChatServiceError | None = None
 
     def create_answer(self, scene_state: Mapping[str, object], user_question: str) -> str:
         self.calls.append((dict(scene_state), user_question))
@@ -61,8 +67,30 @@ class _FakeChatClient:
             raise self.error
         return self.answer
 
+    def create_vision_answer(
+        self,
+        scene_state: Mapping[str, object],
+        user_question: str,
+        jpeg_bytes: bytes,
+    ) -> str:
+        self.vision_calls.append((dict(scene_state), user_question, jpeg_bytes))
+        if self.vision_error is not None:
+            raise self.vision_error
+        return self.vision_answer
+
     def close(self) -> None:
         self.closed = True
+
+
+class _TextOnlyChatClient:
+    """Fake without vision support, mirroring pre-VLM injected clients."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def create_answer(self, scene_state: Mapping[str, object], user_question: str) -> str:
+        self.calls.append(user_question)
+        return "텍스트 전용 답변"
 
 
 def _jpeg(value: int = 127) -> bytes:
@@ -83,12 +111,29 @@ def _test_config(**overrides: object) -> ServerConfig:
     return ServerConfig(**values)  # type: ignore[arg-type]
 
 
-def _chat_app(chat_client: _FakeChatClient):
+def _chat_app(chat_client, **config_overrides: object):
     return create_app(
-        _test_config(),
+        _test_config(**config_overrides),
         lambda: _FakeSession(),
         chat_client_factory=lambda: chat_client,
     )
+
+
+def _stream_one_frame(client: TestClient, session_id: str) -> None:
+    with client.websocket_connect("/ws/vision") as websocket:
+        websocket.send_json(
+            {
+                "type": "start",
+                "session_id": session_id,
+                "source_width": 24,
+                "source_height": 16,
+                "source_fps": 15,
+            }
+        )
+        websocket.send_json({"type": "frame", "sequence_id": 1, "captured_at_ms": None})
+        websocket.send_bytes(_jpeg())
+        assert websocket.receive_json()["sequence_id"] == 1
+        websocket.close()
 
 
 def test_session_endpoint_issues_chat_ready_session() -> None:
@@ -126,7 +171,7 @@ def test_session_endpoint_issues_chat_ready_session() -> None:
 def test_chat_uses_latest_scene_state_from_vision_stream() -> None:
     chat_client = _FakeChatClient()
 
-    with TestClient(_chat_app(chat_client)) as client:
+    with TestClient(_chat_app(chat_client, vlm_fallback_enabled=False)) as client:
         with client.websocket_connect("/ws/vision") as websocket:
             websocket.send_json(
                 {
@@ -400,3 +445,167 @@ def test_chat_client_is_created_once_and_closed_on_shutdown() -> None:
 
     assert factory_calls == 1
     assert chat_client.closed is True
+
+
+def _snapshot(
+    visible_objects: tuple[dict[str, object], ...],
+    scene_confidence: float | None,
+) -> SceneSnapshot:
+    return SceneSnapshot(
+        session_id="s",
+        visible_objects=visible_objects,
+        recent_events=(),
+        latest_narrations=(),
+        updated_at_ms=1,
+        scene_confidence=scene_confidence,
+    )
+
+
+@pytest.mark.parametrize(
+    ("visible_objects", "scene_confidence", "question", "expected"),
+    [
+        ((), None, "앞에 뭐가 보여?", "no_detections"),
+        (({"object_type": "person"},), 0.3, "앞에 뭐가 보여?", "low_confidence"),
+        (({"object_type": "bus"},), 0.9, "버스가 무슨 색이야?", "question_needs_vision"),
+        (({"object_type": "sign"},), 0.9, "표지판에 뭐라고 적혀 있어?", "question_needs_vision"),
+        (({"object_type": "person"},), 0.9, "자세히 설명해줘", "detail_requested"),
+        (({"object_type": "person"},), 0.9, "앞에 뭐가 보여?", None),
+    ],
+)
+def test_vlm_trigger_reasons(
+    visible_objects: tuple[dict[str, object], ...],
+    scene_confidence: float | None,
+    question: str,
+    expected: str | None,
+) -> None:
+    config = _test_config()
+
+    assert (
+        _vlm_trigger_reason(_snapshot(visible_objects, scene_confidence), question, config)
+        == expected
+    )
+
+
+def test_vlm_trigger_disabled_by_config() -> None:
+    config = _test_config(vlm_fallback_enabled=False)
+
+    assert _vlm_trigger_reason(_snapshot((), None), "앞에 뭐가 보여?", config) is None
+
+
+def test_vlm_used_when_no_detections_and_frame_available() -> None:
+    chat_client = _FakeChatClient()
+
+    with TestClient(_chat_app(chat_client)) as client:
+        _stream_one_frame(client, "vlm-session")
+        response = client.post(
+            "/api/chat",
+            json={"session_id": "vlm-session", "user_question": "앞에 뭐가 보여?"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["answer_text"] == "이미지 기반 답변입니다."
+    assert payload["vlm"]["used"] is True
+    assert payload["vlm"]["reason"] == "no_detections"
+    assert payload["vlm"]["latency_ms"] >= 0
+    assert chat_client.calls == []
+    scene_state, question, jpeg_bytes = chat_client.vision_calls[0]
+    assert question == "앞에 뭐가 보여?"
+    assert "visible_objects" in scene_state
+    assert jpeg_bytes.startswith(b"\xff\xd8")
+
+
+def test_vlm_failure_falls_back_to_text_answer() -> None:
+    chat_client = _FakeChatClient()
+    chat_client.vision_error = ChatServiceError("UPSTREAM_TIMEOUT", "timed out")
+
+    with TestClient(_chat_app(chat_client)) as client:
+        _stream_one_frame(client, "vlm-session")
+        response = client.post(
+            "/api/chat",
+            json={"session_id": "vlm-session", "user_question": "앞에 뭐가 보여?"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["answer_text"] == "테스트 답변입니다."
+    assert payload["vlm"]["used"] is False
+    assert payload["vlm"]["reason"] == "vlm_failed:UPSTREAM_TIMEOUT"
+    assert len(chat_client.vision_calls) == 1
+    assert len(chat_client.calls) == 1
+
+
+def test_vlm_cooldown_forces_text_path_on_second_question() -> None:
+    chat_client = _FakeChatClient()
+
+    with TestClient(_chat_app(chat_client, vlm_cooldown_s=60.0)) as client:
+        _stream_one_frame(client, "vlm-session")
+        first = client.post(
+            "/api/chat",
+            json={"session_id": "vlm-session", "user_question": "앞에 뭐가 보여?"},
+        )
+        second = client.post(
+            "/api/chat",
+            json={"session_id": "vlm-session", "user_question": "앞에 뭐가 보여?"},
+        )
+
+    assert first.json()["vlm"]["used"] is True
+    payload = second.json()
+    assert payload["vlm"]["used"] is False
+    assert payload["vlm"]["reason"] == "cooldown_active"
+    assert payload["answer_text"] == "테스트 답변입니다."
+    assert len(chat_client.vision_calls) == 1
+
+
+def test_vlm_skipped_without_recent_frame() -> None:
+    chat_client = _FakeChatClient()
+
+    with TestClient(_chat_app(chat_client)) as client:
+        session_id = client.post("/api/session").json()["session_id"]
+        response = client.post(
+            "/api/chat",
+            json={"session_id": session_id, "user_question": "앞에 뭐가 보여?"},
+        )
+
+    payload = response.json()
+    assert payload["vlm"]["used"] is False
+    assert payload["vlm"]["reason"] == "no_recent_frame"
+    assert payload["answer_text"] == "테스트 답변입니다."
+    assert chat_client.vision_calls == []
+
+
+def test_vlm_keyword_trigger_with_rich_scene() -> None:
+    chat_client = _FakeChatClient()
+    app = create_app(
+        _test_config(),
+        lambda: _FakeRichSession(),
+        chat_client_factory=lambda: chat_client,
+    )
+
+    with TestClient(app) as client:
+        _stream_one_frame(client, "rich-vlm")
+        response = client.post(
+            "/api/chat",
+            json={"session_id": "rich-vlm", "user_question": "버스에 뭐라고 써있어?"},
+        )
+
+    payload = response.json()
+    assert payload["vlm"]["used"] is True
+    assert payload["vlm"]["reason"] == "question_needs_vision"
+
+
+def test_text_only_chat_client_still_works_with_vlm_enabled() -> None:
+    chat_client = _TextOnlyChatClient()
+
+    with TestClient(_chat_app(chat_client)) as client:
+        _stream_one_frame(client, "legacy-session")
+        response = client.post(
+            "/api/chat",
+            json={"session_id": "legacy-session", "user_question": "앞에 뭐가 보여?"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["answer_text"] == "텍스트 전용 답변"
+    assert payload["vlm"]["used"] is False
+    assert payload["vlm"]["reason"] == "client_unsupported"

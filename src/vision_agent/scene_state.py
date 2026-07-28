@@ -28,6 +28,9 @@ class SceneSnapshot:
     recent_events: tuple[dict[str, object], ...]
     latest_narrations: tuple[str, ...]
     updated_at_ms: int | None
+    # Internal scene-quality signal (best detection confidence); deliberately
+    # excluded from to_dict() so the chat model never sees raw numbers.
+    scene_confidence: float | None = None
 
     @property
     def has_analysis(self) -> bool:
@@ -43,10 +46,17 @@ class SceneSnapshot:
 
 
 class _SessionState:
-    __slots__ = ("visible_objects", "recent_events", "latest_narrations", "updated_at_ms")
+    __slots__ = (
+        "visible_objects",
+        "recent_events",
+        "latest_narrations",
+        "updated_at_ms",
+        "scene_confidence",
+    )
 
     def __init__(self, max_recent_events: int, max_narrations: int) -> None:
         self.visible_objects: tuple[dict[str, object], ...] = ()
+        self.scene_confidence: float | None = None
         # Events and narrations are stored with the frame time they arrived
         # at so snapshots can drop entries the camera has since moved past.
         self.recent_events: deque[tuple[int, dict[str, object]]] = deque(maxlen=max_recent_events)
@@ -100,6 +110,7 @@ class SceneStateStore:
         analysis_events: Sequence[Mapping[str, object]] = (),
         narrations: Sequence[str] = (),
         visible_objects: Sequence[Mapping[str, object]] | None = None,
+        scene_confidence: float | None = None,
         updated_at_ms: int | None = None,
     ) -> None:
         """Record the newest analysis results for a session.
@@ -122,6 +133,7 @@ class SceneStateStore:
                 state.visible_objects = tuple(
                     dict(item) for item in visible_objects if isinstance(item, Mapping)
                 )
+                state.scene_confidence = scene_confidence
             state.updated_at_ms = resolved_at_ms
 
     def snapshot(self, session_id: str) -> SceneSnapshot | None:
@@ -158,6 +170,7 @@ class SceneStateStore:
                 recent_events=tuple(recent_events),
                 latest_narrations=tuple(latest_narrations),
                 updated_at_ms=state.updated_at_ms,
+                scene_confidence=state.scene_confidence,
             )
 
     def known(self, session_id: str) -> bool:

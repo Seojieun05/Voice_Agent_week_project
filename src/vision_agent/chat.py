@@ -8,6 +8,7 @@ logged. Raw frames or audio never reach this module.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -56,19 +57,38 @@ SYSTEM_PROMPT = (
 )
 
 
+VISION_SYSTEM_PROMPT = (
+    SYSTEM_PROMPT + "\n추가 규칙 (이미지 제공 시):\n"
+    "7. 첨부된 이미지는 사용자의 카메라가 방금 찍은 현재 장면입니다. 이미지를 직접 보고 "
+    "답하되, scene_state의 YOLO 감지 결과와 교차 확인합니다. 이미지와 감지 결과가 다르면 "
+    "이미지에서 직접 본 것을 우선합니다.\n"
+    "8. 장면 설명 요청이면 같은 구조를 유지합니다: 한 문장 전체 요약 후, 가장 중요한 물체 "
+    "하나를 2문장 이내로 구체적으로(위치, 상태, 적힌 글자·그림) 설명합니다.\n"
+    "9. 이미지 속 글자나 표지판·화면 내용을 읽을 수 있으면 반드시 읽어줍니다."
+)
+
+
 class ChatServiceError(Exception):
     """Raised when an answer cannot be produced; carries a stable error code."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.retryable = retryable
 
 
 class ChatClientProtocol(Protocol):
     """Runtime contract used by the server and its test fakes."""
 
     def create_answer(self, scene_state: Mapping[str, object], user_question: str) -> str: ...
+
+    def create_vision_answer(
+        self,
+        scene_state: Mapping[str, object],
+        user_question: str,
+        jpeg_bytes: bytes,
+    ) -> str: ...
 
 
 def build_chat_messages(
@@ -94,6 +114,9 @@ class GrokConfig:
     timeout_s: float = 20.0
     temperature: float = 0.2
     max_tokens: int = 300
+    vision_model: str = ""
+    vision_timeout_s: float = 30.0
+    vision_max_retries: int = 1
 
     def __post_init__(self) -> None:
         if not self.api_key.strip():
@@ -106,6 +129,14 @@ class GrokConfig:
             raise ValueError("timeout_s must be positive")
         if self.max_tokens < 1:
             raise ValueError("max_tokens must be at least 1")
+        if self.vision_timeout_s <= 0.0:
+            raise ValueError("vision_timeout_s must be positive")
+        if self.vision_max_retries < 0:
+            raise ValueError("vision_max_retries must not be negative")
+
+    @property
+    def resolved_vision_model(self) -> str:
+        return self.vision_model.strip() or self.model
 
     @classmethod
     def from_environment(cls) -> GrokConfig:
@@ -126,6 +157,9 @@ class GrokConfig:
             or DEFAULT_GROK_BASE_URL,
             model=os.getenv("GROK_MODEL", DEFAULT_GROK_MODEL).strip() or DEFAULT_GROK_MODEL,
             timeout_s=float(os.getenv("GROK_TIMEOUT_S", "20")),
+            vision_model=os.getenv("GROK_VISION_MODEL", "").strip(),
+            vision_timeout_s=float(os.getenv("GROK_VISION_TIMEOUT_S", "30")),
+            vision_max_retries=int(os.getenv("GROK_VISION_MAX_RETRIES", "1")),
         )
 
 
@@ -165,17 +199,70 @@ class GrokChatClient:
             "temperature": self._config.temperature,
             "max_tokens": self._config.max_tokens,
         }
+        return self._complete(body, timeout_s=self._config.timeout_s)
+
+    def create_vision_answer(
+        self,
+        scene_state: Mapping[str, object],
+        user_question: str,
+        jpeg_bytes: bytes,
+    ) -> str:
+        """Answer with the current camera frame attached, retrying transient failures."""
+        image_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+        payload_text = json.dumps(
+            {"scene_state": dict(scene_state), "user_question": user_question},
+            ensure_ascii=False,
+        )
+        body = {
+            "model": self._config.resolved_vision_model,
+            "messages": [
+                {"role": "system", "content": VISION_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": payload_text},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_b64}",
+                                "detail": "high",
+                            },
+                        },
+                    ],
+                },
+            ],
+            "temperature": self._config.temperature,
+            "max_tokens": self._config.max_tokens,
+        }
+        attempts = self._config.vision_max_retries + 1
+        for attempt in range(attempts):
+            try:
+                return self._complete(body, timeout_s=self._config.vision_timeout_s)
+            except ChatServiceError as exc:
+                if not exc.retryable or attempt == attempts - 1:
+                    raise
+                LOGGER.warning(
+                    "Grok vision call failed (attempt %s/%s) code=%s; retrying",
+                    attempt + 1,
+                    attempts,
+                    exc.code,
+                )
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def _complete(self, body: Mapping[str, object], *, timeout_s: float) -> str:
         try:
-            response = self._client.post("/chat/completions", json=body)
+            response = self._client.post("/chat/completions", json=dict(body), timeout=timeout_s)
         except httpx.TimeoutException as exc:
             raise ChatServiceError(
                 "UPSTREAM_TIMEOUT",
                 "Grok API request timed out",
+                retryable=True,
             ) from exc
         except httpx.HTTPError as exc:
             raise ChatServiceError(
                 "UPSTREAM_UNAVAILABLE",
                 "Grok API request failed",
+                retryable=True,
             ) from exc
 
         if response.status_code != 200:
@@ -185,6 +272,7 @@ class GrokChatClient:
             raise ChatServiceError(
                 "UPSTREAM_ERROR",
                 f"Grok API returned status {response.status_code}",
+                retryable=response.status_code >= 500,
             )
 
         try:

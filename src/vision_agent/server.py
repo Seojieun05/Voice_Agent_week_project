@@ -28,7 +28,8 @@ except ImportError as exc:  # pragma: no cover - exercised by installations with
         "`pip install -e '.[server]'`."
     ) from exc
 
-from .scene_state import SceneStateStore
+from .frame_buffer import BufferedFrame, FrameRingBuffer
+from .scene_state import SceneSnapshot, SceneStateStore
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .chat import ChatClientProtocol
@@ -103,6 +104,13 @@ class ServerConfig:
     max_session_id_length: int = 128
     max_question_length: int = 500
     debug_frame_dir: Path | None = None
+    vlm_fallback_enabled: bool = True
+    vlm_confidence_threshold: float = 0.45
+    vlm_cooldown_s: float = 5.0
+    vlm_max_image_bytes: int = 1024 * 1024
+    vlm_max_image_dim: int = 1024
+    frame_buffer_frames: int = 5
+    frame_buffer_max_age_s: float = 10.0
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -121,11 +129,22 @@ class ServerConfig:
             ("max_frame_height", self.max_frame_height),
             ("max_session_id_length", self.max_session_id_length),
             ("max_question_length", self.max_question_length),
+            ("vlm_max_image_bytes", self.vlm_max_image_bytes),
+            ("vlm_max_image_dim", self.vlm_max_image_dim),
+            ("frame_buffer_frames", self.frame_buffer_frames),
         ):
             if value < 1:
                 raise ValueError(f"{name} must be at least 1")
         if not math.isfinite(self.max_receive_fps) or self.max_receive_fps < 0.0:
             raise ValueError("max_receive_fps must be non-negative")
+        if not math.isfinite(self.vlm_confidence_threshold) or not (
+            0.0 <= self.vlm_confidence_threshold <= 1.0
+        ):
+            raise ValueError("vlm_confidence_threshold must be between 0 and 1")
+        if not math.isfinite(self.vlm_cooldown_s) or self.vlm_cooldown_s < 0.0:
+            raise ValueError("vlm_cooldown_s must be non-negative")
+        if not math.isfinite(self.frame_buffer_max_age_s) or self.frame_buffer_max_age_s <= 0.0:
+            raise ValueError("frame_buffer_max_age_s must be positive")
         if self.debug_frame_dir is not None and not isinstance(self.debug_frame_dir, Path):
             object.__setattr__(self, "debug_frame_dir", Path(self.debug_frame_dir))
 
@@ -164,6 +183,22 @@ class ServerConfig:
             max_question_length=_environment_int("VISION_SERVER_MAX_QUESTION_LENGTH", 500),
             debug_frame_dir=(
                 Path(normalized_debug_frame_dir) if normalized_debug_frame_dir else None
+            ),
+            vlm_fallback_enabled=_environment_bool("VISION_SERVER_VLM_FALLBACK_ENABLED", True),
+            vlm_confidence_threshold=_environment_float(
+                "VISION_SERVER_VLM_CONFIDENCE_THRESHOLD",
+                0.45,
+            ),
+            vlm_cooldown_s=_environment_float("VISION_SERVER_VLM_COOLDOWN_S", 5.0),
+            vlm_max_image_bytes=_environment_int(
+                "VISION_SERVER_VLM_MAX_IMAGE_BYTES",
+                1024 * 1024,
+            ),
+            vlm_max_image_dim=_environment_int("VISION_SERVER_VLM_MAX_IMAGE_DIM", 1024),
+            frame_buffer_frames=_environment_int("VISION_SERVER_FRAME_BUFFER_FRAMES", 5),
+            frame_buffer_max_age_s=_environment_float(
+                "VISION_SERVER_FRAME_BUFFER_MAX_AGE_S",
+                10.0,
             ),
         )
 
@@ -566,16 +601,21 @@ def _visible_object_text(attributes: Mapping[str, object]) -> str | None:
     return None
 
 
-def _serialized_visible_objects(analysis: object, frame_width: int) -> list[dict[str, object]]:
+def _serialized_visible_objects(
+    analysis: object,
+    frame_width: int,
+) -> tuple[list[dict[str, object]], float | None]:
     """Summarize what is currently visible for the chat scene state.
 
     Unlike ``analysis_events`` (state changes only), this reflects every
     detection in the latest frame, enriched with analyzer state and confirmed
-    OCR text but stripped of internal debug attributes.
+    OCR text but stripped of internal debug attributes. Also returns the best
+    detection confidence of the kept objects so the VLM fallback can judge
+    scene quality without exposing raw numbers to the chat model.
     """
     detections = getattr(analysis, "detections", ())
     if not isinstance(detections, Sequence) or isinstance(detections, (str, bytes, bytearray)):
-        return []
+        return [], None
     results_by_index = getattr(analysis, "analysis_results_by_index", {})
     if not isinstance(results_by_index, Mapping):
         results_by_index = {}
@@ -639,7 +679,101 @@ def _serialized_visible_objects(analysis: object, frame_width: int) -> list[dict
     # Importance-first ordering: the first entry is the one the answer
     # should describe in detail, and truncation drops only low-signal items.
     objects.sort(key=lambda item: item[:3], reverse=True)
-    return [entry for _, _, _, entry in objects[:_MAX_VISIBLE_OBJECTS]]
+    kept = objects[:_MAX_VISIBLE_OBJECTS]
+    scene_confidence = max((confidence for _, _, confidence, _ in kept), default=None)
+    return [entry for _, _, _, entry in kept], scene_confidence
+
+
+_VLM_DETAIL_KEYWORDS = ("자세히", "상세", "구체적", "묘사")
+_VLM_VISION_KEYWORDS = (
+    "색",
+    "글자",
+    "글씨",
+    "뭐라",
+    "적혀",
+    "써 있",
+    "써있",
+    "쓰여",
+    "읽어",
+    "그림",
+    "모양",
+    "생겼",
+    "모습",
+    "입은",
+    "입고",
+    "표정",
+)
+
+
+def _vlm_trigger_reason(
+    snapshot: SceneSnapshot,
+    question: str,
+    config: ServerConfig,
+) -> str | None:
+    """Decide whether this question warrants the Grok Vision fallback."""
+    if not config.vlm_fallback_enabled:
+        return None
+    if not snapshot.visible_objects:
+        return "no_detections"
+    if (
+        snapshot.scene_confidence is not None
+        and snapshot.scene_confidence < config.vlm_confidence_threshold
+    ):
+        return "low_confidence"
+    if any(keyword in question for keyword in _VLM_VISION_KEYWORDS):
+        return "question_needs_vision"
+    if any(keyword in question for keyword in _VLM_DETAIL_KEYWORDS):
+        return "detail_requested"
+    return None
+
+
+def _frame_sharpness(frame: np.ndarray) -> float:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def _select_vlm_image(frames: Sequence[BufferedFrame], config: ServerConfig) -> bytes | None:
+    """Pick the sharpest of the most recent frames and bound its size.
+
+    CPU-bound (JPEG decode + Laplacian); run off the event loop. Returns
+    re-encoded JPEG bytes within the configured limits, or None when no
+    buffered frame decodes.
+    """
+    best_frame: np.ndarray | None = None
+    best_sharpness = -1.0
+    # Newest-first so ties prefer the most recent frame.
+    for buffered in list(frames)[::-1][:3]:
+        encoded = np.frombuffer(buffered.jpeg_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        if frame is None or frame.size == 0:
+            continue
+        sharpness = _frame_sharpness(frame)
+        if sharpness > best_sharpness:
+            best_frame = frame
+            best_sharpness = sharpness
+    if best_frame is None:
+        return None
+
+    height, width = best_frame.shape[:2]
+    longest = max(height, width)
+    if longest > config.vlm_max_image_dim:
+        scale = config.vlm_max_image_dim / float(longest)
+        best_frame = cv2.resize(
+            best_frame,
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    for quality in (85, 70, 55):
+        ok, encoded_jpeg = cv2.imencode(
+            ".jpg",
+            best_frame,
+            [int(cv2.IMWRITE_JPEG_QUALITY), quality],
+        )
+        if not ok:
+            return None
+        if len(encoded_jpeg) <= config.vlm_max_image_bytes:
+            return encoded_jpeg.tobytes()
+    return None
 
 
 def _safe_timings(analysis: object) -> dict[str, float]:
@@ -691,6 +825,8 @@ def create_app(
     build_session = session_factory or _default_session_factory(server_config)
     build_chat_client = chat_client_factory or _default_chat_client_factory
     store = scene_store or SceneStateStore()
+    frame_buffer = FrameRingBuffer(max_frames=server_config.frame_buffer_frames)
+    vlm_last_called: dict[str, float] = {}
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vision-worker")
     gate = _SingleSessionGate()
     chat_client: "ChatClientProtocol | None" = None
@@ -774,9 +910,56 @@ def create_app(
                 0,
                 round((now_ms - snapshot.updated_at_ms) / 1000.0),
             )
+
+        trigger = _vlm_trigger_reason(snapshot, question, server_config)
+        vlm_meta: dict[str, object] = {"used": False, "reason": None, "latency_ms": None}
+
+        async def try_vlm_answer(vlm_client: "ChatClientProtocol") -> str | None:
+            """Attempt the vision fallback; on any miss record why and return None."""
+            create_vision = getattr(vlm_client, "create_vision_answer", None)
+            if not callable(create_vision):
+                vlm_meta["reason"] = "client_unsupported"
+                return None
+            now_s = time.monotonic()
+            last_called_s = vlm_last_called.get(session_id)
+            if last_called_s is not None and now_s - last_called_s < server_config.vlm_cooldown_s:
+                vlm_meta["reason"] = "cooldown_active"
+                return None
+            frames = frame_buffer.recent(
+                session_id,
+                max_age_ms=int(server_config.frame_buffer_max_age_s * 1000.0),
+            )
+            if not frames:
+                vlm_meta["reason"] = "no_recent_frame"
+                return None
+            image = await asyncio.to_thread(_select_vlm_image, frames, server_config)
+            if image is None:
+                vlm_meta["reason"] = "no_usable_frame"
+                return None
+            # Stamp before calling so failures also respect the cooldown.
+            vlm_last_called[session_id] = now_s
+            if len(vlm_last_called) > 512:
+                for stale_key, _ in sorted(vlm_last_called.items(), key=lambda kv: kv[1])[:256]:
+                    vlm_last_called.pop(stale_key, None)
+            started_s = time.perf_counter()
+            try:
+                answer = await asyncio.to_thread(create_vision, scene_state, question, image)
+            except ChatServiceError as exc:
+                vlm_meta["reason"] = f"vlm_failed:{exc.code}"
+                LOGGER.warning("vlm fallback failed trigger=%s code=%s", trigger, exc.code)
+                return None
+            latency_ms = round((time.perf_counter() - started_s) * 1000.0, 1)
+            vlm_meta.update({"used": True, "reason": trigger, "latency_ms": latency_ms})
+            LOGGER.info("vlm fallback used trigger=%s latency_ms=%s", trigger, latency_ms)
+            return answer
+
         try:
             client = await _chat_client()
-            answer_text = await asyncio.to_thread(client.create_answer, scene_state, question)
+            answer_text: str | None = None
+            if trigger is not None:
+                answer_text = await try_vlm_answer(client)
+            if answer_text is None:
+                answer_text = await asyncio.to_thread(client.create_answer, scene_state, question)
         except ChatServiceError as exc:
             # Configuration problems are the operator's to fix (503); the rest
             # are upstream failures (502). The connection must survive both.
@@ -800,6 +983,7 @@ def create_app(
                 "answer_text": answer_text,
                 "has_scene_analysis": snapshot.has_analysis,
                 "scene_state_updated_at_ms": snapshot.updated_at_ms,
+                "vlm": vlm_meta,
             }
         )
 
@@ -904,14 +1088,16 @@ def create_app(
                         getattr(analysis, "narrations", ())
                     )
                     completed_at_ms = time.time_ns() // 1_000_000
+                    visible_objects, scene_confidence = _serialized_visible_objects(
+                        analysis,
+                        outcome.frame_width,
+                    )
                     store.update(
                         vision_session_id,
                         analysis_events=serialized_events,
                         narrations=serialized_narrations,
-                        visible_objects=_serialized_visible_objects(
-                            analysis,
-                            outcome.frame_width,
-                        ),
+                        visible_objects=visible_objects,
+                        scene_confidence=scene_confidence,
                         updated_at_ms=completed_at_ms,
                     )
                     response: dict[str, object] = {
@@ -1084,6 +1270,14 @@ def create_app(
                         continue
                     metrics.received_at_window.append(received_at_s)
 
+                # Keep the accepted JPEG for potential VLM fallback use;
+                # memory only, bounded by the per-session ring buffer.
+                frame_buffer.append(
+                    start.session_id,
+                    raw_binary,
+                    sequence_id=completed_header.sequence_id,
+                    received_at_ms=server_received_at_ms,
+                )
                 pending = _PendingFrame(
                     sequence_id=completed_header.sequence_id,
                     captured_at_ms=completed_header.captured_at_ms,
