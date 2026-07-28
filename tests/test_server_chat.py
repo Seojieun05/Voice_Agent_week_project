@@ -749,3 +749,22 @@ def test_wide_close_object_keeps_blocking_position() -> None:
     objects, _confidence = _serialized_visible_objects(analysis, 24, 16)
 
     assert objects == [{"object_type": "bench", "position": "전방 전체", "distance": "가까움"}]
+
+
+def test_own_feet_person_box_is_ignored() -> None:
+    from vision_agent.server import _serialized_visible_objects
+
+    # Frame 24x16. A "person" starting low and running off the bottom edge
+    # is the user's own feet/legs; a real close person shows a head higher
+    # in the frame and must be kept.
+    analysis = _FakeRichAnalysis(
+        detections=[
+            _FakeDetection("person", 0.9, (8.0, 10.0, 16.0, 16.0)),
+            _FakeDetection("person", 0.9, (8.0, 2.0, 16.0, 16.0)),
+        ],
+        analysis_results_by_index={},
+    )
+
+    objects, _confidence = _serialized_visible_objects(analysis, 24, 16)
+
+    assert objects == [{"object_type": "person", "position": "중앙", "distance": "가까움"}]

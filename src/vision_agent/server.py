@@ -697,6 +697,19 @@ def _serialized_visible_objects(
             right = _finite_number(xyxy[2])
             top = _finite_number(xyxy[1])
             bottom = _finite_number(xyxy[3])
+            # A "person" whose box starts low in the frame and runs off the
+            # bottom edge is the user's own feet/legs entering the shot, not
+            # someone standing in front (a real close person shows a head in
+            # the upper half). Reporting it caused "앞에 사람이 있어요".
+            if (
+                object_type.lower() == "person"
+                and top is not None
+                and bottom is not None
+                and frame_height > 0
+                and top >= frame_height * 0.55
+                and bottom >= frame_height * 0.95
+            ):
+                continue
             if left is not None and right is not None:
                 position = _position_label(left, right, frame_width)
                 if position is not None:
