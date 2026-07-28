@@ -363,6 +363,9 @@ def test_create_tool_answer_executes_tools_and_returns_final() -> None:
         "get_current_scene",
         "find_object",
         "check_traffic_light",
+        "get_recent_changes",
+        "read_detected_text",
+        "check_camera_status",
         "analyze_frame_with_vlm",
     ]
     second = requests[1]

@@ -135,10 +135,13 @@
 - `answer_text`: 앱이 TTS로 읽어줄 한국어 문장.
 - `has_scene_analysis`: 이 세션에서 분석된 프레임이 하나라도 있었는지. `false`면 장면 근거 없이 답한 것이다.
 - `scene_state_updated_at_ms`: 답변에 사용된 장면 상태의 마지막 갱신 시각. 앱은 이 값이 오래됐으면(예: 5초 이상) 사용자에게 알릴 수 있다.
-- `tool_calls`: 답변 생성 중 Grok이 호출한 서버 도구 목록. 서버는 Grok에 4개 도구를 제공하며 Grok이 질문에 따라 자율적으로 호출한다:
+- `tool_calls`: 답변 생성 중 Grok이 호출한 서버 도구 목록. 서버는 Grok에 7개 도구를 제공하며 Grok이 질문에 따라 자율적으로 호출한다:
   - `get_current_scene()` — 최신 YOLO 감지 전체(클래스, confidence, bbox, 추적 ID, 방향, 거리, 화면 점유율, 탐지 시각)
   - `find_object(name)` — 특정 객체 탐지 여부·방향·크기·confidence (영문 클래스명 또는 한국어 별칭: 사람/버스/신호등/볼라드 등)
   - `check_traffic_light()` — 신호 상태, 판정 신뢰도, 마지막 갱신 시각, 최근 신호 이벤트
+  - `get_recent_changes()` — 최근 몇 초간의 등장/사라짐/상태 변화 이벤트(seconds_ago)와 최근 안내 문장
+  - `read_detected_text()` — OCR이 확정한 화면 속 글자(버스 번호·표지판·키오스크 문구)를 VLM 호출 없이 즉시 반환
+  - `check_camera_status()` — 스트림 연결 여부, 마지막 분석 시각, 버퍼된 프레임 수 등 데이터 신선도 진단
   - `analyze_frame_with_vlm(question)` — 최근 프레임 1장을 Grok Vision으로 직접 분석 (cooldown 적용, 실패 시 오류 객체 반환)
 - `vlm`: Grok Vision fallback 메타데이터. YOLO 결과만으로 부족할 때(감지 없음·낮은 신뢰도·색/글자 등 시각 질문·상세 설명 요청·진행/횡단 판단) 서버가 최근 프레임 1장을 Grok Vision에 함께 보낸다. `used`가 true면 `reason`은 트리거 사유(`no_detections`/`low_confidence`/`question_needs_vision`/`detail_requested`/`path_check`), `latency_ms`는 VLM 호출 소요 시간. false면 `reason`에 미사용/실패 사유(`cooldown_active`, `no_recent_frame`, `vlm_failed:<code>` 등)가 담기며 답변은 YOLO 장면 정보만으로 생성된 것이다. VLM 실패는 HTTP 에러가 아니라 폴백으로 처리된다.
 

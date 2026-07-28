@@ -134,6 +134,43 @@ CHAT_TOOLS: list[dict[str, object]] = [
     {
         "type": "function",
         "function": {
+            "name": "get_recent_changes",
+            "description": (
+                "최근 몇 초 동안의 장면 변화를 반환합니다: 물체 등장/사라짐, 신호 변화 "
+                "이벤트(몇 초 전인지 포함)와 시스템이 최근 말한 안내 문장. '방금 뭐가 "
+                "지나갔어?', '뭐가 바뀌었어?' 같은 과거 질문에 사용하세요."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_detected_text",
+            "description": (
+                "OCR이 이미 확정한 화면 속 글자(버스 번호, 표지판 문구, 키오스크 화면 "
+                "내용)를 즉시 반환합니다. 이미지 분석보다 빠르고 비용이 없으므로 글자 "
+                "질문에는 이 도구를 먼저 시도하고, 비어 있을 때만 analyze_frame_with_vlm을 "
+                "사용하세요."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_camera_status",
+            "description": (
+                "카메라 스트림 연결 여부, 마지막 분석 시각, 버퍼된 프레임 수 등 시스템 "
+                "상태를 반환합니다. 화면 정보가 없거나 오래된 것 같을 때, 또는 사용자가 "
+                "카메라가 잘 되는지 물을 때 사용하세요."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "analyze_frame_with_vlm",
             "description": (
                 "현재 카메라 프레임 이미지를 비전 모델로 직접 분석합니다. 객체 목록만으로 "
@@ -160,8 +197,13 @@ TOOL_PROMPT = (
     "- 객체의 개수·목록·위치를 묻는 질문: get_current_scene을 호출합니다.\n"
     "- 특정 물체가 있는지 묻는 질문: find_object를 호출합니다.\n"
     "- 신호등·횡단 관련 질문: check_traffic_light를 호출합니다.\n"
-    "- 장면 묘사, 글자 읽기, 길·바닥 상태, 색상 등 이미지를 직접 봐야 하는 질문과 "
-    "'가도 돼?' 같은 이동 판단: analyze_frame_with_vlm을 호출합니다.\n"
+    "- '방금', '아까', '바뀌었어' 같은 최근 변화 질문: get_recent_changes를 호출합니다.\n"
+    "- 버스 번호·표지판·화면 글자 질문: read_detected_text를 먼저 호출하고, 비어 있으면 "
+    "analyze_frame_with_vlm으로 이미지에서 직접 읽습니다.\n"
+    "- 화면 정보가 없거나 오래됐거나 카메라 상태를 물으면: check_camera_status를 "
+    "호출합니다.\n"
+    "- 장면 묘사, 길·바닥 상태, 색상 등 이미지를 직접 봐야 하는 질문과 '가도 돼?' 같은 "
+    "이동 판단: analyze_frame_with_vlm을 호출합니다.\n"
     "도구 결과에 없는 내용을 지어내지 않으며, 도구가 오류를 반환하면 가진 정보만으로 "
     "짧게 답합니다. 같은 도구를 반복 호출하지 않습니다."
 )

@@ -894,6 +894,9 @@ class _FakeToolChatClient(_FakeChatClient):
             "scene": execute_tool("get_current_scene", {}),
             "find": execute_tool("find_object", {"name": "버스"}),
             "light": execute_tool("check_traffic_light", {}),
+            "changes": execute_tool("get_recent_changes", {}),
+            "text": execute_tool("read_detected_text", {}),
+            "camera": execute_tool("check_camera_status", {}),
             "vlm": execute_tool("analyze_frame_with_vlm", {"question": "길 상태는?"}),
             "unknown": execute_tool("bogus_tool", {}),
         }
@@ -938,6 +941,14 @@ def test_chat_prefers_tool_calling_path_and_executes_server_tools() -> None:
     assert find["matches"][0]["class_name"] == "bus"
     light = chat_client.tool_results["light"]
     assert light["state"] == "GREEN"
+    changes = chat_client.tool_results["changes"]
+    assert "recent_events" in changes and "recent_narrations" in changes
+    text = chat_client.tool_results["text"]
+    assert text["found"] is True
+    assert text["texts"][0] == {"object_type": "bus", "text": "146", "direction": "오른쪽"}
+    camera = chat_client.tool_results["camera"]
+    assert camera["has_any_analysis"] is True
+    assert camera["buffered_frame_count"] == 1
     assert chat_client.tool_results["unknown"] == {"error": "unknown_tool:bogus_tool"}
 
 
@@ -971,3 +982,80 @@ def test_vlm_tool_respects_cooldown_and_missing_frames() -> None:
         )
         assert chat_client.tool_results["vlm"]["error"] == "cooldown_active"
         assert chat_client.tool_results["vlm"]["retry_after_s"] > 0
+
+
+def test_tool_get_recent_changes_returns_events_and_narrations() -> None:
+    from vision_agent.server import _tool_get_recent_changes
+
+    result = _tool_get_recent_changes(_raw_snapshot())
+
+    assert [event["object_type"] for event in result["recent_events"]] == [
+        "pedestrian_signal",
+        "bus",
+    ]
+    assert result["recent_narrations"] == []
+    assert result["seconds_since_last_frame"] >= 0
+
+
+def test_tool_read_detected_text_collects_ocr_texts() -> None:
+    from vision_agent.server import _tool_read_detected_text
+
+    snapshot = SceneSnapshot(
+        session_id="s",
+        visible_objects=(
+            {"object_type": "bus", "position": "오른쪽", "text": "146"},
+            {"object_type": "person", "position": "중앙"},
+            {"object_type": "sign", "text": "  "},
+        ),
+        recent_events=(),
+        latest_narrations=(),
+        updated_at_ms=1,
+    )
+
+    result = _tool_read_detected_text(snapshot)
+
+    assert result["found"] is True
+    assert result["texts"] == [{"object_type": "bus", "text": "146", "direction": "오른쪽"}]
+
+    empty = _tool_read_detected_text(
+        SceneSnapshot(
+            session_id="s",
+            visible_objects=(),
+            recent_events=(),
+            latest_narrations=(),
+            updated_at_ms=None,
+        )
+    )
+    assert empty["found"] is False
+
+
+def test_tool_check_camera_status_reports_freshness() -> None:
+    from vision_agent.frame_buffer import BufferedFrame
+    from vision_agent.server import _tool_check_camera_status
+
+    frames = [BufferedFrame(sequence_id=1, received_at_ms=0, jpeg_bytes=b"x")]
+    result = _tool_check_camera_status(_raw_snapshot(), frames, stream_active=True)
+
+    assert result["stream_connected"] is True
+    assert result["has_any_analysis"] is True
+    assert result["buffered_frame_count"] == 1
+    assert result["newest_frame_age_s"] >= 0
+
+    idle = _tool_check_camera_status(
+        SceneSnapshot(
+            session_id="s",
+            visible_objects=(),
+            recent_events=(),
+            latest_narrations=(),
+            updated_at_ms=None,
+        ),
+        [],
+        stream_active=False,
+    )
+    assert idle == {
+        "stream_connected": False,
+        "has_any_analysis": False,
+        "seconds_since_last_analysis": None,
+        "buffered_frame_count": 0,
+        "newest_frame_age_s": None,
+    }

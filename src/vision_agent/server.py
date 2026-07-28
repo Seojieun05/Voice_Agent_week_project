@@ -923,6 +923,60 @@ def _tool_check_traffic_light(snapshot: SceneSnapshot) -> dict[str, object]:
     }
 
 
+def _tool_get_recent_changes(snapshot: SceneSnapshot) -> dict[str, object]:
+    """Chat tool: what changed recently (events + spoken narrations)."""
+    return {
+        "recent_events": [dict(event) for event in snapshot.recent_events],
+        "recent_narrations": list(snapshot.latest_narrations),
+        "seconds_since_last_frame": _seconds_since(snapshot.updated_at_ms),
+        "note": "recent_events의 seconds_ago는 몇 초 전 발생했는지를 뜻합니다",
+    }
+
+
+def _tool_read_detected_text(snapshot: SceneSnapshot) -> dict[str, object]:
+    """Chat tool: OCR-confirmed text currently visible, without a VLM call."""
+    texts = []
+    for item in snapshot.visible_objects:
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            entry: dict[str, object] = {
+                "object_type": item.get("object_type"),
+                "text": text.strip(),
+            }
+            if "position" in item:
+                entry["direction"] = item["position"]
+            texts.append(entry)
+    return {
+        "texts": texts,
+        "found": bool(texts),
+        "seconds_since_detection": _seconds_since(snapshot.updated_at_ms),
+        "note": (
+            "OCR로 확정된 글자만 포함됩니다. 비어 있으면 analyze_frame_with_vlm으로 "
+            "이미지에서 직접 읽어볼 수 있습니다"
+        ),
+    }
+
+
+def _tool_check_camera_status(
+    snapshot: SceneSnapshot,
+    buffered_frames: Sequence[BufferedFrame],
+    stream_active: bool,
+) -> dict[str, object]:
+    """Chat tool: is the camera stream healthy and how fresh is the data."""
+    newest_frame_age_s = None
+    if buffered_frames:
+        now_ms = time.time_ns() // 1_000_000
+        newest_ms = max(frame.received_at_ms for frame in buffered_frames)
+        newest_frame_age_s = max(0.0, round((now_ms - newest_ms) / 1000.0, 1))
+    return {
+        "stream_connected": stream_active,
+        "has_any_analysis": snapshot.has_analysis,
+        "seconds_since_last_analysis": _seconds_since(snapshot.updated_at_ms),
+        "buffered_frame_count": len(buffered_frames),
+        "newest_frame_age_s": newest_frame_age_s,
+    }
+
+
 _VLM_DETAIL_KEYWORDS = ("자세히", "상세", "구체적", "묘사")
 _VLM_VISION_KEYWORDS = (
     "색",
@@ -1226,6 +1280,16 @@ def create_app(
                     return _tool_find_object(snapshot, str(arguments.get("name", "")))
                 if name == "check_traffic_light":
                     return _tool_check_traffic_light(snapshot)
+                if name == "get_recent_changes":
+                    return _tool_get_recent_changes(snapshot)
+                if name == "read_detected_text":
+                    return _tool_read_detected_text(snapshot)
+                if name == "check_camera_status":
+                    return _tool_check_camera_status(
+                        snapshot,
+                        frame_buffer.recent(session_id),
+                        gate.active,
+                    )
                 if name == "analyze_frame_with_vlm":
                     vlm_question = str(arguments.get("question", "")).strip() or question
                     return run_vlm_tool(tool_client, vlm_question)
