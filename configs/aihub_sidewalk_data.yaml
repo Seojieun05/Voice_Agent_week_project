@@ -1,0 +1,39 @@
+# Ultralytics data config for the converted AIHub sidewalk dataset.
+# Generate the dataset first:
+#   python scripts/convert_cvat_xml.py \
+#     --xml datasets/raw/aihub/sidewalk/train/*.xml \
+#     --images-root datasets/raw/aihub/sidewalk/train \
+#     --output-root datasets/processed/aihub_sidewalk \
+#     --class-mapping configs/aihub_sidewalk_classes.json \
+#     --split train --val-fraction 0.1 --link-mode symlink
+# NOTE: Ultralytics resolves a relative `path` against its global
+# datasets_dir, not this file's location — use an absolute path
+# (adjust to your checkout location).
+path: /home/student/Voice_Agent_week_project/datasets/processed/aihub_sidewalk
+train: images/train
+val: images/val
+names:
+  0: person
+  1: bicycle
+  2: car
+  3: motorcycle
+  4: bus
+  5: truck
+  6: traffic_light
+  7: traffic_sign
+  8: stop_sign
+  9: bench
+  10: chair
+  11: table
+  12: potted_plant
+  13: fire_hydrant
+  14: pole
+  15: tree_trunk
+  16: bollard
+  17: barricade
+  18: movable_signage
+  19: kiosk
+  20: carrier
+  21: stroller
+  22: wheelchair
+  23: parking_meter

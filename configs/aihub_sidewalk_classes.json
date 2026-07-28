@@ -1,0 +1,31 @@
+{
+  "classes": [
+    "person",
+    "bicycle",
+    "car",
+    "motorcycle",
+    "bus",
+    "truck",
+    "traffic_light",
+    "traffic_sign",
+    "stop_sign",
+    "bench",
+    "chair",
+    "table",
+    "potted_plant",
+    "fire_hydrant",
+    "pole",
+    "tree_trunk",
+    "bollard",
+    "barricade",
+    "movable_signage",
+    "kiosk",
+    "carrier",
+    "stroller",
+    "wheelchair",
+    "parking_meter"
+  ],
+  "label_map": {
+    "stop": "stop_sign"
+  }
+}

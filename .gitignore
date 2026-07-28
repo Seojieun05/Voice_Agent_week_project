@@ -22,6 +22,9 @@ visual_assistant_test_video_pack_builder/*.zip
 visual_assistant_test_video_pack_builder/download_results.json
 datasets/public_baseline/review/*
 !datasets/public_baseline/review/.gitkeep
+datasets/raw/*
+datasets/processed/*
+runs/
 
 # Editors / OS
 .vscode/
