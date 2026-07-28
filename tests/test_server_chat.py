@@ -114,7 +114,12 @@ def test_session_endpoint_issues_chat_ready_session() -> None:
     assert payload["has_scene_analysis"] is False
     assert payload["scene_state_updated_at_ms"] is None
     scene_state, question = chat_client.calls[0]
-    assert scene_state == {"recent_events": [], "latest_narrations": [], "updated_at_ms": None}
+    assert scene_state == {
+        "visible_objects": [],
+        "recent_events": [],
+        "latest_narrations": [],
+        "updated_at_ms": None,
+    }
     assert question == "앞에 뭐가 보여?"
 
 
@@ -151,8 +156,113 @@ def test_chat_uses_latest_scene_state_from_vision_stream() -> None:
     assert payload["scene_state_updated_at_ms"] > 0
     scene_state, question = chat_client.calls[0]
     assert question == "지금 건너도 돼?"
+    assert scene_state["visible_objects"] == []
     assert scene_state["latest_narrations"] == ["frame 1", "frame 2"]
     assert [event["sequence_id"] for event in scene_state["recent_events"]] == [1, 2]
+
+
+@dataclass(frozen=True, slots=True)
+class _FakeDetection:
+    class_name: str
+    confidence: float
+    xyxy: tuple[float, float, float, float]
+
+
+@dataclass(frozen=True, slots=True)
+class _FakeResult:
+    object_type: str
+    state: str | None = None
+    is_uncertain: bool = False
+    attributes: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _FakeRichAnalysis:
+    detections: list[_FakeDetection]
+    analysis_results_by_index: dict[int, _FakeResult]
+    analysis_events: list[object] = field(default_factory=list)
+    narrations: list[str] = field(default_factory=list)
+    timings: dict[str, float] = field(default_factory=dict)
+
+
+class _FakeRichSession:
+    """Session whose frames report currently visible objects (frame is 24px wide)."""
+
+    model_load_ms = 1.0
+
+    def process_frame(self, frame: np.ndarray, context: object) -> _FakeRichAnalysis:
+        return _FakeRichAnalysis(
+            detections=[
+                _FakeDetection("bus", 0.9, (16.0, 0.0, 24.0, 10.0)),
+                _FakeDetection("traffic light", 0.5, (0.0, 0.0, 8.0, 10.0)),
+                _FakeDetection("person", 0.95, (8.0, 0.0, 16.0, 10.0)),
+            ],
+            analysis_results_by_index={
+                0: _FakeResult("bus", attributes={"route_number": "146"}),
+                1: _FakeResult("pedestrian_signal", state="GREEN", is_uncertain=True),
+            },
+        )
+
+    def reset(self) -> None:
+        pass
+
+
+def test_chat_scene_state_includes_visible_objects_with_text_and_position() -> None:
+    chat_client = _FakeChatClient()
+    app = create_app(
+        _test_config(),
+        lambda: _FakeRichSession(),
+        chat_client_factory=lambda: chat_client,
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/vision") as websocket:
+            websocket.send_json(
+                {
+                    "type": "start",
+                    "session_id": "rich-session",
+                    "source_width": 24,
+                    "source_height": 16,
+                    "source_fps": 15,
+                }
+            )
+            websocket.send_json({"type": "frame", "sequence_id": 1, "captured_at_ms": None})
+            websocket.send_bytes(_jpeg())
+            analysis_response = websocket.receive_json()
+            assert analysis_response["sequence_id"] == 1
+
+            response = client.post(
+                "/api/chat",
+                json={"session_id": "rich-session", "user_question": "앞에 뭐가 보여?"},
+            )
+            websocket.close()
+
+    assert response.status_code == 200
+    scene_state, _question = chat_client.calls[0]
+    # Objects with state or readable text come first; internal debug
+    # attributes never reach the chat scene state.
+    assert scene_state["visible_objects"] == [
+        {
+            "object_type": "bus",
+            "confidence": 0.9,
+            "position": "오른쪽",
+            "text": "146",
+        },
+        {
+            "object_type": "pedestrian_signal",
+            "confidence": 0.5,
+            "position": "왼쪽",
+            "state": "GREEN",
+            "is_uncertain": True,
+        },
+        {
+            "object_type": "person",
+            "confidence": 0.95,
+            "position": "중앙",
+        },
+    ]
+    # The WebSocket response format is unchanged by the chat feature.
+    assert "visible_objects" not in analysis_response
 
 
 def test_chat_rejects_unknown_session() -> None:

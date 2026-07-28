@@ -97,7 +97,10 @@
 }
 ```
 
-서버는 프레임을 처리할 때마다 해당 세션의 최신 `analysis_events`/`narrations`를 내부 장면 상태 저장소에 보관한다. 이것이 `/api/chat` 답변의 근거가 된다.
+서버는 프레임을 처리할 때마다 해당 세션의 장면 상태를 내부 저장소에 보관하며, 이것이 `/api/chat` 답변의 근거가 된다:
+
+- `visible_objects`: 마지막 프레임에 실제로 보인 물체 요약(종류, 위치 왼쪽/중앙/오른쪽, 신호 상태, OCR로 읽은 글자 — 버스 번호·표지판·키오스크 문구). 매 프레임 교체된다.
+- `analysis_events`/`narrations`: 최근 상태 변화 이벤트와 안내 문장(누적, 개수 제한).
 
 주요 에러 코드: `SESSION_BUSY`, `INVALID_START`, `INVALID_FRAME_HEADER`, `INVALID_MESSAGE_ORDER`, `FRAME_TOO_LARGE`, `RATE_LIMITED`, `INVALID_JPEG`, `PROCESSING_FAILED`.
 

@@ -24,6 +24,7 @@ class SceneSnapshot:
     """Immutable view of the latest analysis results for one session."""
 
     session_id: str
+    visible_objects: tuple[dict[str, object], ...]
     recent_events: tuple[dict[str, object], ...]
     latest_narrations: tuple[str, ...]
     updated_at_ms: int | None
@@ -34,6 +35,7 @@ class SceneSnapshot:
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "visible_objects": [dict(item) for item in self.visible_objects],
             "recent_events": [dict(event) for event in self.recent_events],
             "latest_narrations": list(self.latest_narrations),
             "updated_at_ms": self.updated_at_ms,
@@ -41,9 +43,10 @@ class SceneSnapshot:
 
 
 class _SessionState:
-    __slots__ = ("recent_events", "latest_narrations", "updated_at_ms")
+    __slots__ = ("visible_objects", "recent_events", "latest_narrations", "updated_at_ms")
 
     def __init__(self, max_recent_events: int, max_narrations: int) -> None:
+        self.visible_objects: tuple[dict[str, object], ...] = ()
         self.recent_events: deque[dict[str, object]] = deque(maxlen=max_recent_events)
         self.latest_narrations: deque[str] = deque(maxlen=max_narrations)
         self.updated_at_ms: int | None = None
@@ -86,9 +89,15 @@ class SceneStateStore:
         *,
         analysis_events: Sequence[Mapping[str, object]] = (),
         narrations: Sequence[str] = (),
+        visible_objects: Sequence[Mapping[str, object]] | None = None,
         updated_at_ms: int | None = None,
     ) -> None:
-        """Record the newest analysis results for a session."""
+        """Record the newest analysis results for a session.
+
+        ``analysis_events`` and ``narrations`` accumulate (bounded); a
+        non-None ``visible_objects`` replaces the previous frame's view,
+        because it describes what is visible right now.
+        """
         with self._lock:
             state = self._touch(session_id)
             for event in analysis_events:
@@ -98,6 +107,10 @@ class SceneStateStore:
                 message = str(narration).strip()
                 if message:
                     state.latest_narrations.append(message)
+            if visible_objects is not None:
+                state.visible_objects = tuple(
+                    dict(item) for item in visible_objects if isinstance(item, Mapping)
+                )
             state.updated_at_ms = updated_at_ms if updated_at_ms is not None else _now_ms()
 
     def snapshot(self, session_id: str) -> SceneSnapshot | None:
@@ -108,6 +121,7 @@ class SceneStateStore:
                 return None
             return SceneSnapshot(
                 session_id=session_id,
+                visible_objects=tuple(dict(item) for item in state.visible_objects),
                 recent_events=tuple(dict(event) for event in state.recent_events),
                 latest_narrations=tuple(state.latest_narrations),
                 updated_at_ms=state.updated_at_ms,

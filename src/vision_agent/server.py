@@ -201,6 +201,7 @@ class _FrameOutcome:
     error_code: str | None = None
     error_message: str | None = None
     process_invoked: bool = False
+    frame_width: int = 0
 
 
 @dataclass(slots=True)
@@ -491,6 +492,7 @@ def _process_pending_frame(
         processing_started_at_s=processing_started_at_s,
         completed_at_s=time.perf_counter(),
         process_invoked=True,
+        frame_width=width,
     )
 
 
@@ -523,6 +525,96 @@ def _serialized_narrations(raw_narrations: object) -> list[str]:
         if message:
             messages.append(message)
     return messages
+
+
+_MAX_VISIBLE_OBJECTS = 12
+
+
+def _visible_object_text(attributes: Mapping[str, object]) -> str | None:
+    """Extract confirmed OCR text (sign text, bus route, kiosk lines) if any."""
+    for key in ("text", "route_number"):
+        value = attributes.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    visible_text = attributes.get("visible_text")
+    if isinstance(visible_text, Sequence) and not isinstance(
+        visible_text,
+        (str, bytes, bytearray),
+    ):
+        lines = [str(line).strip() for line in visible_text if str(line).strip()]
+        if lines:
+            return " / ".join(lines[:5])
+    return None
+
+
+def _serialized_visible_objects(analysis: object, frame_width: int) -> list[dict[str, object]]:
+    """Summarize what is currently visible for the chat scene state.
+
+    Unlike ``analysis_events`` (state changes only), this reflects every
+    detection in the latest frame, enriched with analyzer state and confirmed
+    OCR text but stripped of internal debug attributes.
+    """
+    detections = getattr(analysis, "detections", ())
+    if not isinstance(detections, Sequence) or isinstance(detections, (str, bytes, bytearray)):
+        return []
+    results_by_index = getattr(analysis, "analysis_results_by_index", {})
+    if not isinstance(results_by_index, Mapping):
+        results_by_index = {}
+
+    objects: list[dict[str, object]] = []
+    for index, detection in enumerate(detections):
+        object_type = str(getattr(detection, "class_name", "")).strip()
+        if not object_type:
+            continue
+        entry: dict[str, object] = {"object_type": object_type}
+        confidence = _finite_number(getattr(detection, "confidence", None))
+        if confidence is not None:
+            entry["confidence"] = round(confidence, 3)
+
+        xyxy = getattr(detection, "xyxy", None)
+        if (
+            frame_width > 0
+            and isinstance(xyxy, Sequence)
+            and not isinstance(xyxy, (str, bytes, bytearray))
+            and len(xyxy) == 4
+        ):
+            left = _finite_number(xyxy[0])
+            right = _finite_number(xyxy[2])
+            if left is not None and right is not None:
+                center = (left + right) / 2.0 / frame_width
+                if center < 1.0 / 3.0:
+                    entry["position"] = "왼쪽"
+                elif center > 2.0 / 3.0:
+                    entry["position"] = "오른쪽"
+                else:
+                    entry["position"] = "중앙"
+
+        result = results_by_index.get(index)
+        if result is not None:
+            result_type = str(getattr(result, "object_type", "")).strip()
+            if result_type:
+                entry["object_type"] = result_type
+            state = getattr(result, "state", None)
+            if state is not None:
+                state_text = str(getattr(state, "value", state)).strip()
+                if state_text:
+                    entry["state"] = state_text
+            if bool(getattr(result, "is_uncertain", False)):
+                entry["is_uncertain"] = True
+            attributes = getattr(result, "attributes", None)
+            if isinstance(attributes, Mapping):
+                text = _visible_object_text(attributes)
+                if text is not None:
+                    entry["text"] = text
+        objects.append(entry)
+
+    # Objects with analyzer state or readable text matter most to the user;
+    # keep them first so truncation drops only low-signal detections.
+    objects.sort(
+        key=lambda item: ("state" in item or "text" in item, item.get("confidence", 0.0)),
+        reverse=True,
+    )
+    return objects[:_MAX_VISIBLE_OBJECTS]
 
 
 def _safe_timings(analysis: object) -> dict[str, float]:
@@ -776,9 +868,7 @@ def create_app(
                             "total_server_ms": max(0.0, total_server_ms),
                         }
                     )
-                    serialized_events = _serialized_events(
-                        getattr(analysis, "analysis_events", ())
-                    )
+                    serialized_events = _serialized_events(getattr(analysis, "analysis_events", ()))
                     serialized_narrations = _serialized_narrations(
                         getattr(analysis, "narrations", ())
                     )
@@ -787,6 +877,10 @@ def create_app(
                         vision_session_id,
                         analysis_events=serialized_events,
                         narrations=serialized_narrations,
+                        visible_objects=_serialized_visible_objects(
+                            analysis,
+                            outcome.frame_width,
+                        ),
                         updated_at_ms=completed_at_ms,
                     )
                     response: dict[str, object] = {

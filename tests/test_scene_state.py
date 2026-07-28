@@ -21,6 +21,7 @@ def test_registered_session_has_empty_snapshot_without_analysis() -> None:
     assert snapshot is not None
     assert snapshot.has_analysis is False
     assert snapshot.to_dict() == {
+        "visible_objects": [],
         "recent_events": [],
         "latest_narrations": [],
         "updated_at_ms": None,
@@ -56,6 +57,40 @@ def test_update_accumulates_across_frames_and_skips_blank_narrations() -> None:
     assert [event["event_type"] for event in snapshot.recent_events] == ["A"]
     assert snapshot.latest_narrations == ("signal turned green",)
     assert snapshot.updated_at_ms == 2
+
+
+def test_visible_objects_replace_previous_frame() -> None:
+    store = SceneStateStore()
+    store.update(
+        "session-a",
+        visible_objects=[{"object_type": "bus"}, {"object_type": "person"}],
+        updated_at_ms=1,
+    )
+    store.update(
+        "session-a",
+        visible_objects=[{"object_type": "traffic_light"}],
+        updated_at_ms=2,
+    )
+
+    snapshot = store.snapshot("session-a")
+
+    assert snapshot is not None
+    assert snapshot.visible_objects == ({"object_type": "traffic_light"},)
+
+
+def test_visible_objects_none_keeps_previous_and_empty_clears() -> None:
+    store = SceneStateStore()
+    store.update("session-a", visible_objects=[{"object_type": "bus"}], updated_at_ms=1)
+    store.update("session-a", narrations=["update without objects"], updated_at_ms=2)
+
+    kept = store.snapshot("session-a")
+    assert kept is not None
+    assert kept.visible_objects == ({"object_type": "bus"},)
+
+    store.update("session-a", visible_objects=[], updated_at_ms=3)
+    cleared = store.snapshot("session-a")
+    assert cleared is not None
+    assert cleared.visible_objects == ()
 
 
 def test_update_without_timestamp_uses_current_time() -> None:
