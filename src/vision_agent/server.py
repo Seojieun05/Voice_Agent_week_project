@@ -647,9 +647,17 @@ def _distance_label(
     if height_ratio <= 0.0 or width_ratio <= 0.0:
         return None
     area_ratio = height_ratio * width_ratio
-    if height_ratio >= 0.5 or area_ratio >= 0.25:
+    bottom_ratio = min(bottom, float(frame_height)) / frame_height
+    # "가까움" must mean imminent (roughly within arm's-to-two-steps reach):
+    # a pedestrian a few meters away already fills half the frame height, so
+    # close requires a dominant box or one that reaches the frame bottom.
+    if (
+        height_ratio >= 0.8
+        or area_ratio >= 0.4
+        or (height_ratio >= 0.55 and bottom_ratio >= 0.85)
+    ):
         return "가까움"
-    if height_ratio >= 0.25 or area_ratio >= 0.10:
+    if height_ratio >= 0.35 or area_ratio >= 0.12:
         return "중간"
     return "멀리"
 

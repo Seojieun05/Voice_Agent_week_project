@@ -292,25 +292,25 @@ def test_chat_scene_state_includes_visible_objects_with_text_and_position() -> N
         {
             "object_type": "pedestrian_signal",
             "position": "왼쪽",
-            "distance": "가까움",
+            "distance": "중간",
             "state": "GREEN",
             "is_uncertain": True,
         },
         {
             "object_type": "bus",
             "position": "오른쪽",
-            "distance": "가까움",
+            "distance": "중간",
             "text": "146",
         },
         {
             "object_type": "person",
             "position": "중앙",
-            "distance": "가까움",
+            "distance": "중간",
         },
         {
             "object_type": "person",
             "position": "왼쪽",
-            "distance": "가까움",
+            "distance": "중간",
             "is_uncertain": True,
         },
     ]
@@ -683,6 +683,11 @@ def test_distance_label_scales_with_apparent_size() -> None:
     assert _distance_label(45.0, 55.0, 40.0, 55.0, 100, 100) == "멀리"
     # Mid-distance: about a third of the frame height.
     assert _distance_label(40.0, 60.0, 30.0, 65.0, 100, 100) == "중간"
-    # Close obstacle: fills most of the frame height.
+    # A person filling ~60% of the height but floating mid-frame is a few
+    # meters away — walking past them is fine, so not "가까움".
+    assert _distance_label(30.0, 50.0, 10.0, 70.0, 100, 100) == "중간"
+    # Same size but reaching the frame bottom: right in front of the user.
+    assert _distance_label(30.0, 60.0, 30.0, 100.0, 100, 100) == "가까움"
+    # Dominant box filling most of the frame height.
     assert _distance_label(20.0, 80.0, 10.0, 90.0, 100, 100) == "가까움"
     assert _distance_label(0.0, 10.0, 0.0, 10.0, 0, 100) is None
