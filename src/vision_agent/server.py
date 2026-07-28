@@ -232,6 +232,34 @@ class _SingleSessionGate:
         self.active = False
 
 
+async def _wait_shielded(
+    future: "asyncio.Future[None]",
+    failure_message: str,
+) -> asyncio.CancelledError | None:
+    """Wait for cleanup work to finish even while this task is being cancelled.
+
+    A bare ``await future`` is unsafe during cancellation: cancelling a task
+    also cancels the future it is currently awaiting, and an executor future
+    that has not started yet is then discarded without ever running.
+    Cancellation can also be delivered repeatedly (anyio cancel scopes
+    re-cancel at every checkpoint), so every retry must be shielded again,
+    not just the first attempt. Returns the first observed cancellation so
+    the caller can re-raise it once cleanup is complete.
+    """
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+            if future.cancelled():
+                return cancellation
+            continue
+        except Exception:
+            LOGGER.exception(failure_message)
+        return cancellation
+
+
 def _error_payload(
     code: str,
     message: str,
@@ -825,36 +853,21 @@ def create_app(
                     if abandoned is not None:
                         metrics.dropped_frames += 1
                 frame_queue.put_nowait(None)
-                try:
-                    await asyncio.shield(worker_task)
-                except asyncio.CancelledError as exc:
-                    cancellation = exc
-                    try:
-                        await worker_task
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception:
-                        LOGGER.exception("vision worker stopped unexpectedly")
-                except Exception:
-                    LOGGER.exception("vision worker stopped unexpectedly")
+                cancellation = await _wait_shielded(
+                    worker_task,
+                    "vision worker stopped unexpectedly",
+                )
             if session is not None:
                 reset_future = asyncio.get_running_loop().run_in_executor(
                     executor,
                     session.reset,
                 )
-                try:
-                    await asyncio.shield(reset_future)
-                except asyncio.CancelledError as exc:
-                    if cancellation is None:
-                        cancellation = exc
-                    try:
-                        await reset_future
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception:
-                        LOGGER.exception("vision session reset failed during disconnect")
-                except Exception:
-                    LOGGER.exception("vision session reset failed during disconnect")
+                reset_cancellation = await _wait_shielded(
+                    reset_future,
+                    "vision session reset failed during disconnect",
+                )
+                if cancellation is None:
+                    cancellation = reset_cancellation
             p50_ms = _percentile(metrics.total_latency_ms or (), 0.50)
             p95_ms = _percentile(metrics.total_latency_ms or (), 0.95)
             LOGGER.info(
