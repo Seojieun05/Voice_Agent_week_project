@@ -7,4 +7,4 @@ if [ -f .env ]; then
 fi
 set +a
 
-python -m uvicorn vision_agent.server:app --host 0.0.0.0 --port 8000 --workers 1 "$@"
+.venv/bin/python -m uvicorn vision_agent.server:app --host 0.0.0.0 --port 8000 --workers 1 "$@"
