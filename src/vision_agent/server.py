@@ -576,7 +576,7 @@ def _visible_object_importance(object_type: str) -> int:
     normalized = object_type.strip().lower().replace(" ", "_")
     if "signal" in normalized or "traffic_light" in normalized:
         return 5
-    if normalized in {"bus", "car", "truck", "van", "motorcycle", "train"}:
+    if normalized in {"bus", "car", "truck", "van", "motorcycle", "train", "scooter"}:
         return 4
     if normalized in {"person", "bicycle", "wheelchair", "stroller", "dog"}:
         return 3
@@ -841,6 +841,8 @@ _OBJECT_NAME_ALIASES = {
     "소화전": "fire_hydrant",
     "입간판": "movable_signage",
     "간판": "movable_signage",
+    "킥보드": "scooter",
+    "스쿠터": "scooter",
 }
 
 

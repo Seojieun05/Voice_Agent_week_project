@@ -23,7 +23,8 @@
     "carrier",
     "stroller",
     "wheelchair",
-    "parking_meter"
+    "parking_meter",
+    "scooter"
   ],
   "label_map": {
     "stop": "stop_sign"
