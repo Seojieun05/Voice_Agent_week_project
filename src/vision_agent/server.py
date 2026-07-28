@@ -12,18 +12,26 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+from uuid import uuid4
 
 import cv2
 import numpy as np
 
 try:
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi.responses import JSONResponse
+    from pydantic import BaseModel
 except ImportError as exc:  # pragma: no cover - exercised by installations without server extras
     raise RuntimeError(
         "FastAPI server dependencies are unavailable. Install them with "
         "`pip install -e '.[server]'`."
     ) from exc
+
+from .scene_state import SceneStateStore
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .chat import ChatClientProtocol
 
 
 LOGGER = logging.getLogger(__name__)
@@ -40,6 +48,7 @@ class VisionSessionProtocol(Protocol):
 
 
 SessionFactory = Callable[[], VisionSessionProtocol]
+ChatClientFactory = Callable[[], "ChatClientProtocol"]
 
 
 def _environment_int(name: str, default: int) -> int:
@@ -92,6 +101,7 @@ class ServerConfig:
     max_frame_height: int = 2160
     max_receive_fps: float = 30.0
     max_session_id_length: int = 128
+    max_question_length: int = 500
     debug_frame_dir: Path | None = None
 
     def __post_init__(self) -> None:
@@ -110,6 +120,7 @@ class ServerConfig:
             ("max_frame_width", self.max_frame_width),
             ("max_frame_height", self.max_frame_height),
             ("max_session_id_length", self.max_session_id_length),
+            ("max_question_length", self.max_question_length),
         ):
             if value < 1:
                 raise ValueError(f"{name} must be at least 1")
@@ -150,6 +161,7 @@ class ServerConfig:
             max_frame_width=_environment_int("VISION_SERVER_MAX_FRAME_WIDTH", 3840),
             max_frame_height=_environment_int("VISION_SERVER_MAX_FRAME_HEIGHT", 2160),
             max_receive_fps=_environment_float("VISION_SERVER_MAX_RECEIVE_FPS", 30.0),
+            max_question_length=_environment_int("VISION_SERVER_MAX_QUESTION_LENGTH", 500),
             debug_frame_dir=(
                 Path(normalized_debug_frame_dir) if normalized_debug_frame_dir else None
             ),
@@ -510,24 +522,54 @@ def _percentile(values: Sequence[float], percentile: float) -> float | None:
     return ordered[lower_index] + (ordered[upper_index] - ordered[lower_index]) * fraction
 
 
+class _ChatRequest(BaseModel):
+    session_id: str
+    user_question: str
+
+
+def _default_chat_client_factory() -> "ChatClientProtocol":
+    # Chat dependencies stay optional for vision-only installations, so the
+    # Grok client is imported only when the chat API is actually used.
+    from .chat import GrokChatClient
+
+    return GrokChatClient.from_environment()
+
+
 def create_app(
     config: ServerConfig | None = None,
     session_factory: SessionFactory | None = None,
+    chat_client_factory: ChatClientFactory | None = None,
+    scene_store: SceneStateStore | None = None,
 ) -> FastAPI:
     """Create an injectable single-session FastAPI application."""
     server_config = config or ServerConfig.from_environment()
     build_session = session_factory or _default_session_factory(server_config)
+    build_chat_client = chat_client_factory or _default_chat_client_factory
+    store = scene_store or SceneStateStore()
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vision-worker")
     gate = _SingleSessionGate()
+    chat_client: "ChatClientProtocol | None" = None
+    chat_client_guard = asyncio.Lock()
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
         yield
         executor.shutdown(wait=True, cancel_futures=True)
+        close = getattr(chat_client, "close", None)
+        if callable(close):
+            close()
 
     application = FastAPI(title="Voice Agent Vision Server", lifespan=lifespan)
     application.state.server_config = server_config
     application.state.session_gate = gate
+    application.state.scene_store = store
+
+    async def _chat_client() -> "ChatClientProtocol":
+        nonlocal chat_client
+        async with chat_client_guard:
+            if chat_client is None:
+                chat_client = build_chat_client()
+            return chat_client
 
     @application.get("/health")
     async def health() -> dict[str, object]:
@@ -535,6 +577,80 @@ def create_app(
             "status": "ok",
             "active_session": gate.active,
         }
+
+    @application.post("/api/session")
+    async def create_session() -> dict[str, object]:
+        session_id = uuid4().hex
+        store.register(session_id)
+        return {
+            "session_id": session_id,
+            "created_at_ms": time.time_ns() // 1_000_000,
+        }
+
+    @application.post("/api/chat")
+    async def chat(request: _ChatRequest) -> JSONResponse:
+        from .chat import ChatServiceError
+
+        session_id = request.session_id.strip()
+        question = request.user_question.strip()
+        if not session_id or len(session_id) > server_config.max_session_id_length:
+            return JSONResponse(
+                status_code=400,
+                content=_error_payload("INVALID_SESSION_ID", "session_id is empty or too long"),
+            )
+        if not question:
+            return JSONResponse(
+                status_code=400,
+                content=_error_payload("INVALID_QUESTION", "user_question must not be empty"),
+            )
+        if len(question) > server_config.max_question_length:
+            return JSONResponse(
+                status_code=400,
+                content=_error_payload(
+                    "QUESTION_TOO_LONG",
+                    "user_question exceeds the configured maximum length",
+                ),
+            )
+        snapshot = store.snapshot(session_id)
+        if snapshot is None:
+            return JSONResponse(
+                status_code=404,
+                content=_error_payload(
+                    "SESSION_NOT_FOUND",
+                    "unknown session_id; create one via POST /api/session "
+                    "or start a /ws/vision stream first",
+                ),
+            )
+
+        scene_state = snapshot.to_dict()
+        try:
+            client = await _chat_client()
+            answer_text = await asyncio.to_thread(client.create_answer, scene_state, question)
+        except ChatServiceError as exc:
+            # Configuration problems are the operator's to fix (503); the rest
+            # are upstream failures (502). The connection must survive both.
+            status_code = 503 if exc.code == "MISSING_API_KEY" else 502
+            LOGGER.warning("chat answer failed code=%s", exc.code)
+            return JSONResponse(
+                status_code=status_code,
+                content=_error_payload(exc.code, exc.message),
+            )
+        except Exception:
+            LOGGER.exception("chat answer failed unexpectedly")
+            return JSONResponse(
+                status_code=500,
+                content=_error_payload("CHAT_FAILED", "chat answer could not be generated"),
+            )
+
+        return JSONResponse(
+            content={
+                "type": "chat_answer",
+                "session_id": session_id,
+                "answer_text": answer_text,
+                "has_scene_analysis": snapshot.has_analysis,
+                "scene_state_updated_at_ms": snapshot.updated_at_ms,
+            }
+        )
 
     @application.websocket("/ws/vision")
     async def vision_websocket(websocket: WebSocket) -> None:
@@ -566,7 +682,7 @@ def create_app(
                 return False
             return True
 
-        async def worker() -> None:
+        async def worker(vision_session_id: str) -> None:
             nonlocal session
             processed_index = 0
             loop = asyncio.get_running_loop()
@@ -632,21 +748,32 @@ def create_app(
                             "total_server_ms": max(0.0, total_server_ms),
                         }
                     )
+                    serialized_events = _serialized_events(
+                        getattr(analysis, "analysis_events", ())
+                    )
+                    serialized_narrations = _serialized_narrations(
+                        getattr(analysis, "narrations", ())
+                    )
+                    completed_at_ms = time.time_ns() // 1_000_000
+                    store.update(
+                        vision_session_id,
+                        analysis_events=serialized_events,
+                        narrations=serialized_narrations,
+                        updated_at_ms=completed_at_ms,
+                    )
                     response: dict[str, object] = {
                         "type": "analysis",
                         "sequence_id": pending.sequence_id,
                         "captured_at_ms": pending.captured_at_ms,
                         "server_received_at_ms": pending.server_received_at_ms,
-                        "completed_at_ms": time.time_ns() // 1_000_000,
+                        "completed_at_ms": completed_at_ms,
                         "dropped_frames": metrics.dropped_frames,
                         "received_frames": metrics.received_frames,
                         "processed_frames": metrics.processed_frames,
                         "processing_fps": round(metrics.processing_fps(), 3),
                         "model_load_ms": round(model_load_ms, 3),
-                        "analysis_events": _serialized_events(
-                            getattr(analysis, "analysis_events", ())
-                        ),
-                        "narrations": _serialized_narrations(getattr(analysis, "narrations", ())),
+                        "analysis_events": serialized_events,
+                        "narrations": serialized_narrations,
                         "timings": {key: round(value, 3) for key, value in timings.items()},
                     }
                     await safe_send(response)
@@ -706,7 +833,8 @@ def create_app(
                 start.source_fps,
                 model_load_ms,
             )
-            worker_task = asyncio.create_task(worker())
+            store.register(start.session_id)
+            worker_task = asyncio.create_task(worker(start.session_id))
 
             while True:
                 message = await websocket.receive()

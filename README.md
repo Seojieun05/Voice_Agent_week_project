@@ -147,15 +147,49 @@ python scripts/check_environment.py
 `cuda_available`이 `true`면 GPU 추론이 가능합니다.
 ### 실시간 서버
 
-서버 의존성을 설치하고 단일 worker로 실행합니다.
+#### 설정
+
+Grok API 키를 설정하지 않으면 `/ws/vision`만 동작하고 `/api/chat`은 `MISSING_API_KEY` 에러를 반환합니다.
+
+`.env` 파일로 관리하기(권장):
+
+```bash
+cp .env.example .env
+# .env를 열고 GROK_API_KEY=your-key-here로 수정
+```
+
+또는 환경변수로 직접 설정:
+
+```bash
+export GROK_API_KEY=your-grok-api-key
+```
+
+#### 실행
+
+서버 의존성을 설치합니다.
 
 ```bash
 pip install -e '.[server]'
+```
+
+`.env`를 사용하는 경우 편의 스크립트로 실행:
+
+```bash
+# Linux/macOS
+./run_server.sh
+
+# Windows 또는 Python으로
+python run_server.py
+```
+
+직접 실행:
+
+```bash
 uvicorn vision_agent.server:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
 `/ws/vision`의 단일 세션 제한은 프로세스 안에서 적용되므로 `--workers 1`을 유지해야 합니다.
-상태 확인은 다음과 같습니다.
+상태 확인:
 
 ```bash
 curl http://127.0.0.1:8000/health
@@ -217,6 +251,15 @@ Analyzer에는 서버가 실제 처리한 연속 `processed_index`가 전달됩�
 제거는 `processing_started_at_s` 단조 시계를 사용해 클라이언트 epoch와 서버 monotonic 시각을
 섞지 않습니다. 응답의 frame/event 시각은 유효한 `captured_at_ms`를 우선하되 값이 없거나
 정지·역행하면 실제 처리 간격만큼 단조 증가시킵니다. MP4는 재현 가능한 원본 PTS를 유지합니다.
+
+### 음성 질문(chat) API
+
+`POST /api/session`으로 `session_id`를 발급받고, 같은 ID로 `/ws/vision` 스트림을 시작한 뒤
+`POST /api/chat`에 `{"session_id": ..., "user_question": ...}`를 보내면 서버가 해당 세션의
+최신 장면 분석 결과와 질문을 Grok API에 전달해 `answer_text`를 반환합니다. Grok API 키는
+`GROK_API_KEY`(또는 `XAI_API_KEY`) 환경변수로 설정하며, 키가 없거나 호출이 실패해도 서버와
+영상 스트림은 계속 동작하고 명시적인 에러 코드로 응답합니다. 요청/응답 형식과 에러 코드
+전체는 [docs/api_contract.md](docs/api_contract.md)를 참고하세요.
 
 샘플 MP4 클라이언트는 다음처럼 실행합니다.
 
