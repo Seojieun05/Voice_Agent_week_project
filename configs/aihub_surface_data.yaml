@@ -1,0 +1,20 @@
+# Ultralytics data config for the converted AIHub sidewalk *surface* dataset
+# (segmentation). Generate the dataset first:
+#   python scripts/convert_surface_xml.py \
+#     --roots datasets/raw/aihub/surface \
+#     --output-root datasets/processed/aihub_surface \
+#     --class-mapping configs/aihub_surface_classes.json \
+#     --split train --val-fraction 0.1 --link-mode symlink
+# NOTE: Ultralytics resolves a relative `path` against its global
+# datasets_dir, not this file's location — use an absolute path
+# (adjust to your checkout location; on Colab, regenerate this file).
+path: /home/student/Voice_Agent_week_project/datasets/processed/aihub_surface
+train: images/train
+val: images/val
+names:
+  0: sidewalk
+  1: braille_guide_blocks
+  2: roadway
+  3: alley
+  4: bike_lane
+  5: caution_zone

@@ -1,0 +1,12 @@
+{
+  "_comment": "AIHub 인도보행영상 surface(노면) 클래스. 실제 라벨 이름은 `python scripts/convert_surface_xml.py --roots <root> --inspect` 출력으로 확인한 뒤 맞추세요. 이름이 다르면 label_map에 별칭을 추가하면 됩니다.",
+  "classes": [
+    "sidewalk",
+    "braille_guide_blocks",
+    "roadway",
+    "alley",
+    "bike_lane",
+    "caution_zone"
+  ],
+  "label_map": {}
+}
