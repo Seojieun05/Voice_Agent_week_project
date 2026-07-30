@@ -9,6 +9,7 @@ from vision_agent.event_manager import (
     SCREEN_CHANGED,
     TEXT_CONFIRMED,
 )
+from vision_agent.hazard import HAZARD_DETECTED
 from vision_agent.narration import NarrationPolicy, NarrationScheduler
 from vision_agent.types import AnalysisEvent
 
@@ -454,3 +455,99 @@ def test_invalid_policy_configuration_is_rejected(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         NarrationPolicy(**kwargs)  # type: ignore[arg-type]
+
+
+def hazard_event(
+    *,
+    level: str = "IMMINENT",
+    object_type: str = "bicycle",
+    zone: str = "CENTER",
+    stable_id: str = "stable-haz",
+    timestamp_s: float = 1.0,
+    confidence: float = 0.6,
+    emission_index: int = 1,
+) -> AnalysisEvent:
+    return event(
+        HAZARD_DETECTED,
+        object_type=object_type,
+        stable_id=stable_id,
+        timestamp_s=timestamp_s,
+        current_state=level,
+        confidence=confidence,
+        attributes={
+            "hazard_level": level,
+            "zone": zone,
+            "time_to_contact_s": 1.0,
+            "in_path": True,
+            "emission_index": emission_index,
+        },
+    )
+
+
+def test_hazard_outranks_every_other_event():
+    policy = NarrationPolicy()
+    signal = event(
+        OBJECT_STATE_CHANGED,
+        previous_state="RED",
+        current_state="GREEN",
+    )
+
+    selected = policy.select([signal, hazard_event()])
+
+    assert len(selected) == 1
+    assert selected[0].event.event_type == HAZARD_DETECTED
+    assert NarrationPolicy.priority_for(hazard_event()) == 0
+
+
+def test_imminent_hazard_leads_with_the_action():
+    policy = NarrationPolicy()
+
+    message = policy.message_for(hazard_event(level="IMMINENT", zone="RIGHT"))
+
+    assert message is not None
+    # 끼어들기로 뒤가 잘려도 "위험, 멈추세요."는 이미 전달된다
+    assert message.startswith("위험, 멈추세요.")
+    assert "오른쪽에서 자전거가 빠르게 다가옵니다." in message
+
+
+def test_warning_hazard_leads_with_the_object():
+    policy = NarrationPolicy()
+
+    message = policy.message_for(hazard_event(level="WARNING", object_type="scooter", zone="LEFT"))
+
+    assert message == "킥보드가 왼쪽에서 다가옵니다. 주의하세요."
+
+
+def test_hazard_survives_the_generic_confidence_floor():
+    policy = NarrationPolicy(minimum_confidence=0.9)
+
+    # ApproachMonitor가 자체 게이트를 통과시킨 위험은 일반 문턱으로 지우지 않는다
+    assert policy.message_for(hazard_event(confidence=0.4)) is not None
+
+
+def test_unknown_hazard_level_produces_no_message():
+    policy = NarrationPolicy()
+
+    assert policy.message_for(hazard_event(level="MAYBE")) is None
+
+
+def test_repeated_hazard_is_not_suppressed_by_the_scheduler_cooldown():
+    scheduler = NarrationScheduler(NarrationPolicy(duplicate_cooldown_s=5.0), default_ttl_s=5.0)
+
+    scheduler.enqueue(hazard_event(emission_index=1, timestamp_s=1.0), now_s=1.0)
+    first = scheduler.pop_next(now_s=1.0)
+    # ApproachMonitor가 반복 주기를 지켜 다시 내보낸 위험은 새 정보로 취급한다
+    scheduler.enqueue(hazard_event(emission_index=2, timestamp_s=3.0), now_s=3.0)
+    second = scheduler.pop_next(now_s=3.0)
+
+    assert first is not None
+    assert second is not None
+
+
+def test_same_hazard_emission_is_still_deduplicated():
+    scheduler = NarrationScheduler(NarrationPolicy(duplicate_cooldown_s=5.0), default_ttl_s=5.0)
+
+    scheduler.enqueue(hazard_event(emission_index=1, timestamp_s=1.0), now_s=1.0)
+    assert scheduler.pop_next(now_s=1.0) is not None
+    scheduler.enqueue(hazard_event(emission_index=1, timestamp_s=1.2), now_s=1.2)
+    assert scheduler.pop_next(now_s=1.2) is None

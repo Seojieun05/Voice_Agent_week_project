@@ -102,6 +102,33 @@
 - `visible_objects`: 마지막 프레임에 실제로 보인 물체 요약(종류, 위치 왼쪽/중앙/오른쪽/전방 전체, 거리 가까움/중간/멀리, 신호 상태, OCR로 읽은 글자 — 버스 번호·표지판·키오스크 문구). 매 프레임 교체되며 중요도 순(신호등 > 차량 > 사람 > 표지판·키오스크)으로 정렬된다. 신뢰도가 매우 낮은 감지는 제외되고, 애매한 감지는 `is_uncertain`으로만 표시된다.
 - `analysis_events`/`narrations`: 최근 상태 변화 이벤트와 안내 문장. 개수 제한과 함께 최신 프레임 기준 TTL(이벤트 5초, 안내 8초)이 적용되어 카메라가 지나친 물체는 답변 근거에서 사라진다. 이벤트에는 `seconds_ago`(몇 초 전)가 붙는다.
 
+## 접근 위험 이벤트 (`hazard_detected`)
+
+추적된 박스가 커지는 속도로 충돌 예상 시간(TTC)을 추정해, 사용자에게 빠르게 다가오는 물체를 알린다. 박스 면적은 거리의 제곱에 반비례하므로 `TTC = 2 / (d(ln 면적)/dt)`로 구한다 — 카메라 보정이나 물체 실제 크기가 필요 없다.
+
+기존 `object_approaching`과는 별개다. 그쪽은 버스 분석기가 정류장 진입 같은 느린 움직임을 판정하는 것이고, 이 이벤트는 클래스와 무관하게 박스 변화만 본다.
+
+```json
+{
+  "object_type": "bicycle",
+  "event_type": "hazard_detected",
+  "current_state": "IMMINENT",
+  "confidence": 0.82,
+  "attributes": {
+    "hazard_level": "IMMINENT",
+    "zone": "CENTER",
+    "time_to_contact_s": 1.1,
+    "in_path": true,
+    "emission_index": 1
+  }
+}
+```
+
+- `hazard_level`: `IMMINENT`(기본 TTC 1.5초 이내) 또는 `WARNING`(3.5초 이내).
+- `WARNING`은 스스로 움직이는 물체(사람·자전거·킥보드·오토바이·차량·버스·트럭 등)가 사용자 진행 방향에 있을 때만 나간다. 볼라드·기둥 같은 정적 장애물은 `IMMINENT`에서만 알린다 — 걸어가다 부딪히기 직전이라는 뜻이다.
+- `zone`: `LEFT`/`CENTER`/`RIGHT`. `in_path`는 진행 통로(화면 가운데 50%)와 겹치는지.
+- 안내 문장은 항상 행동을 먼저 말한다: `"위험, 멈추세요. 정면에서 자전거가 빠르게 다가옵니다."` 사용자가 끼어들어 재생을 끊어도 첫 문장으로 필요한 정보가 전달되게 한 것이다. 이 이벤트는 narration 우선순위 0으로 신호 변화보다 먼저 나가고, TTL은 1.5초로 짧다(지난 "멈추세요"는 방해가 된다).
+
 서버는 질문을 자주 나오는 유형(진행 가능 여부, 횡단 가능 여부, 글자 읽기, 물체 위치, 장면 설명)으로 분류해 유형별 답변 템플릿을 적용한다. 예: "앞으로 가도 돼?"는 '네/아니요'로 시작하는 답을 받는다. VLM 프레임 선택은 최신 프레임 기준 1.5초 이내의 프레임만 후보로 사용해 과거 장면이 답변에 쓰이지 않게 한다.
 
 주요 에러 코드: `SESSION_BUSY`, `INVALID_START`, `INVALID_FRAME_HEADER`, `INVALID_MESSAGE_ORDER`, `FRAME_TOO_LARGE`, `RATE_LIMITED`, `INVALID_JPEG`, `PROCESSING_FAILED`.

@@ -19,6 +19,7 @@ from .analyzers import (
 from .event_manager import OBJECT_APPROACHING, SceneEventManager
 from .events import StableObjectEventEngine
 from .io import JsonlWriter
+from .hazard import HAZARD_DETECTED, ApproachMonitor, to_analysis_event
 from .narration import Narration, NarrationPolicy, NarrationScheduler
 from .ocr import OcrEngine, RapidOcrEngine, UnavailableOcrEngine
 from .router import ObjectRouter
@@ -83,6 +84,12 @@ class PipelineConfig:
     narrate_bus_approach: bool = True
     narration_queue_size: int = 32
     narration_ttl_s: float = 5.0
+    hazard_detection_enabled: bool = True
+    hazard_warning_ttc_s: float = 3.5
+    hazard_imminent_ttc_s: float = 1.5
+    hazard_repeat_interval_s: float = 2.0
+    # 위험 안내는 빨리 상해야 한다. 2초 지난 "멈추세요"는 도움이 아니라 방해다.
+    hazard_narration_ttl_s: float = 1.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -571,6 +578,7 @@ class VisionSession:
         object_router: ObjectRouter,
         scene_event_manager: SceneEventManager,
         narration_scheduler: NarrationScheduler,
+        approach_monitor: ApproachMonitor | None = None,
         scheduler_uses_processing_clock: bool = False,
         maximum_state_gap_s: float | None = None,
         model_load_ms: float = 0.0,
@@ -589,6 +597,7 @@ class VisionSession:
         self.object_router = object_router
         self.scene_event_manager = scene_event_manager
         self.narration_scheduler = narration_scheduler
+        self.approach_monitor = approach_monitor
         self.scheduler_uses_processing_clock = scheduler_uses_processing_clock
         self.maximum_state_gap_s = maximum_state_gap_s
         self.model_load_ms = model_load_ms
@@ -612,6 +621,8 @@ class VisionSession:
         self.object_router.reset()
         self.scene_event_manager.reset()
         self.narration_scheduler.reset()
+        if self.approach_monitor is not None:
+            self.approach_monitor.reset()
 
     def reset(self) -> None:
         """Clear tracker, analyzer, event, and narration state for session reuse."""
@@ -750,6 +761,23 @@ class VisionSession:
             scene_events=scene_events,
         )
 
+        # 충돌 위험은 분석기 상태가 아니라 추적된 박스의 크기 변화에서 직접 나온다.
+        # 그래서 analyzer 이벤트와 별도로 계산해 앞에 붙인다.
+        hazard_events: list[AnalysisEvent] = []
+        if self.approach_monitor is not None:
+            frame_height, frame_width = frame.shape[:2]
+            assessments = self.approach_monitor.update(
+                [
+                    (stable_keys_by_index[index].rsplit(":", maxsplit=1)[-1], detections[index])
+                    for index in event_indices
+                ],
+                frame_width=int(frame_width),
+                frame_height=int(frame_height),
+                timestamp_s=timestamp_s,
+            )
+            hazard_events = [to_analysis_event(item, timestamp_s) for item in assessments]
+            analysis_events = [*hazard_events, *analysis_events]
+
         self.narration_scheduler.enqueue(analysis_events, now_s=scheduler_timestamp_s)
         selected = self.narration_scheduler.pop_next(now_s=scheduler_timestamp_s)
         selected_narrations = [selected] if selected is not None else []
@@ -759,6 +787,8 @@ class VisionSession:
             retired_stable_id = retired_object_key.rsplit(":", maxsplit=1)[-1]
             self.object_router.reset(retired_stable_id)
             self.scene_event_manager.reset(retired_stable_id)
+            if self.approach_monitor is not None:
+                self.approach_monitor.reset(retired_stable_id)
 
         analysis_ms = (time.perf_counter() - analysis_started_at) * 1000.0
         total_processing_ms = (time.perf_counter() - processing_started_at) * 1000.0
@@ -837,6 +867,7 @@ def create_vision_session(
             narration_policy,
             max_queue_size=config.narration_queue_size,
             default_ttl_s=config.narration_ttl_s,
+            ttl_by_event_type={HAZARD_DETECTED: config.hazard_narration_ttl_s},
         )
     if scene_event_manager is None:
         scene_event_manager = SceneEventManager(
@@ -875,6 +906,15 @@ def create_vision_session(
         object_router=object_router,
         scene_event_manager=scene_event_manager,
         narration_scheduler=narration_scheduler,
+        approach_monitor=(
+            ApproachMonitor(
+                warning_ttc_s=config.hazard_warning_ttc_s,
+                imminent_ttc_s=config.hazard_imminent_ttc_s,
+                repeat_interval_s=config.hazard_repeat_interval_s,
+            )
+            if config.hazard_detection_enabled
+            else None
+        ),
         scheduler_uses_processing_clock=live_mode,
         maximum_state_gap_s=effective_gap_s,
         model_load_ms=model_load_ms,

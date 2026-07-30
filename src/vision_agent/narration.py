@@ -14,6 +14,7 @@ from .event_manager import (
     SCREEN_CHANGED,
     TEXT_CONFIRMED,
 )
+from .hazard import HAZARD_DETECTED, HazardLevel, HazardZone
 from .object_types import KIOSK_OBJECT_TYPES, SIGNAL_OBJECT_TYPES
 from .types import AnalysisEvent
 
@@ -44,6 +45,33 @@ _OBJECT_LABELS = {
     "person": "사람",
     "car": "자동차",
     "vehicle": "차량",
+    # 보도 데이터셋(AIHub sidewalk)으로 학습한 체크포인트가 내보내는 클래스들.
+    "bicycle": "자전거",
+    "motorcycle": "오토바이",
+    "scooter": "킥보드",
+    "truck": "트럭",
+    "traffic_sign": "표지판",
+    "bench": "벤치",
+    "chair": "의자",
+    "table": "탁자",
+    "potted_plant": "화분",
+    "fire_hydrant": "소화전",
+    "pole": "기둥",
+    "tree_trunk": "가로수",
+    "bollard": "볼라드",
+    "barricade": "바리케이드",
+    "movable_signage": "입간판",
+    "carrier": "손수레",
+    "stroller": "유모차",
+    "wheelchair": "휠체어",
+    "parking_meter": "주차 요금기",
+}
+
+#: 위험 안내에서 방향을 읽는 방식. 값이 "…에서"로 끝나 문장에 그대로 붙는다.
+_HAZARD_ZONE_LABELS = {
+    HazardZone.LEFT.value: "왼쪽에서",
+    HazardZone.CENTER.value: "정면에서",
+    HazardZone.RIGHT.value: "오른쪽에서",
 }
 
 
@@ -141,6 +169,10 @@ class NarrationPolicy:
     @staticmethod
     def priority_for(event: AnalysisEvent) -> int:
         object_type = _normalized_object_type(event.object_type)
+        # 충돌이 임박한 물체는 신호 변화보다 먼저 알려야 한다. 배치당 한 문장만
+        # 나가므로 이 우선순위가 곧 "다른 안내를 밀어낸다"는 뜻이다.
+        if event.event_type == HAZARD_DETECTED:
+            return 0
         if event.event_type == OBJECT_STATE_CHANGED and object_type in SIGNAL_OBJECT_TYPES:
             return 1
         if event.event_type == OBJECT_APPROACHING and object_type in {
@@ -163,8 +195,27 @@ class NarrationPolicy:
             return 7
         return 100
 
+    def _hazard_message(self, event: AnalysisEvent) -> str | None:
+        """Put the danger and the action first; the tail can be cut by a barge-in."""
+        level = str(event.attributes.get("hazard_level", "")).strip().upper()
+        zone = _HAZARD_ZONE_LABELS.get(str(event.attributes.get("zone", "")).strip().upper(), "")
+        object_type = _normalized_object_type(event.object_type)
+        subject = _with_subject_particle(_object_label(object_type))
+        if level == HazardLevel.IMMINENT.value:
+            where = f"{zone} " if zone else ""
+            return f"위험, 멈추세요. {where}{subject} 빠르게 다가옵니다."
+        if level == HazardLevel.WARNING.value:
+            approach = f"{subject} {zone} 다가옵니다." if zone else f"{subject} 다가옵니다."
+            return f"{approach} 주의하세요."
+        return None
+
     def message_for(self, event: AnalysisEvent) -> str | None:
         """Return a pure template result without changing duplicate history."""
+        # 위험 안내는 일반 확신도 문턱보다 먼저 처리한다. ApproachMonitor가 자체
+        # 확신도·일관성 게이트를 이미 통과시킨 것이고, 0.5 문턱에 걸려 충돌 경고가
+        # 사라지는 것이 잘못 경고하는 것보다 나쁘다.
+        if event.event_type == HAZARD_DETECTED:
+            return self._hazard_message(event)
         if event.is_uncertain:
             return None
         if event.confidence < self.minimum_confidence:
@@ -243,11 +294,15 @@ class NarrationPolicy:
             if event.event_type == OBJECT_APPROACHING and object_type == "bus"
             else event.stable_id
         )
-        semantic_identity = (
-            event.attributes.get("screen_fingerprint")
-            if event.event_type == SCREEN_CHANGED
-            else None
-        )
+        if event.event_type == SCREEN_CHANGED:
+            semantic_identity = event.attributes.get("screen_fingerprint")
+        elif event.event_type == HAZARD_DETECTED:
+            # 위험 반복 주기는 ApproachMonitor가 단독으로 정한다. 각 emission을 서로
+            # 다른 것으로 취급해 스케줄러의 일반 중복 억제(기본 5초)가 이중으로
+            # 걸리지 않게 한다.
+            semantic_identity = event.attributes.get("emission_index")
+        else:
+            semantic_identity = None
         return (
             event.event_type,
             object_type,
