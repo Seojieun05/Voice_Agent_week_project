@@ -274,9 +274,26 @@ def assign_split(scene: str, base_split: str, val_fraction: float) -> str:
     return "val" if bucket < int(val_fraction * 1000) else base_split
 
 
-def _place_image(source: Path, target: Path, link_mode: str) -> None:
+def _place_image(source: Path, target: Path, link_mode: str, max_image_size: int = 0) -> None:
     if target.exists() or target.is_symlink():
         target.unlink()
+    if max_image_size > 0:
+        import cv2
+
+        frame = cv2.imread(str(source))
+        if frame is None:
+            raise SystemExit(f"could not read image: {source}")
+        height, width = frame.shape[:2]
+        longest = max(height, width)
+        if longest > max_image_size:
+            scale = max_image_size / longest
+            frame = cv2.resize(
+                frame,
+                (round(width * scale), round(height * scale)),
+                interpolation=cv2.INTER_AREA,
+            )
+        cv2.imwrite(str(target), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        return
     if link_mode == "symlink":
         target.symlink_to(source.resolve())
     else:
@@ -404,6 +421,7 @@ def convert(
     split: str = "train",
     val_fraction: float = 0.0,
     link_mode: str = "copy",
+    max_image_size: int = 0,
     dry_run: bool = False,
     overwrite: bool = False,
     preview_count: int = 8,
@@ -475,7 +493,8 @@ def convert(
                 label_dir.mkdir(parents=True, exist_ok=True)
                 image_dir.mkdir(parents=True, exist_ok=True)
                 label_path = label_dir / f"{output_stem}.txt"
-                image_target = image_dir / f"{output_stem}{source_path.suffix}"
+                suffix = ".jpg" if max_image_size > 0 else source_path.suffix
+                image_target = image_dir / f"{output_stem}{suffix}"
                 if not overwrite and (label_path.exists() or image_target.exists()):
                     raise SystemExit(
                         f"output already exists for '{output_stem}' (use --overwrite to replace)"
@@ -484,7 +503,7 @@ def convert(
                     "\n".join(label_lines) + ("\n" if label_lines else ""),
                     encoding="utf-8",
                 )
-                _place_image(source_path, image_target, link_mode)
+                _place_image(source_path, image_target, link_mode, max_image_size)
                 if kept > 0 and previews_written < preview_count:
                     _write_preview(
                         source_path,
@@ -540,6 +559,15 @@ def main(argv: list[str] | None = None) -> int:
         help="0보다 크면 scene 해시 기준으로 해당 비율을 'val' split으로 분리",
     )
     parser.add_argument("--link-mode", choices=("copy", "symlink"), default="copy")
+    parser.add_argument(
+        "--max-image-size",
+        type=int,
+        default=0,
+        help=(
+            "0보다 크면 긴 변을 이 크기로 줄여 JPEG로 저장 (--link-mode 무시). "
+            "라벨은 정규화 좌표라 그대로 유효하며, 학습 시 이미지 디코딩 병목을 크게 줄인다"
+        ),
+    )
     parser.add_argument("--preview-count", type=int, default=8)
     parser.add_argument("--dry-run", action="store_true", help="파일을 쓰지 않고 통계만 출력")
     parser.add_argument("--overwrite", action="store_true", help="기존 출력 덮어쓰기 허용")
@@ -581,6 +609,7 @@ def main(argv: list[str] | None = None) -> int:
         split=args.split,
         val_fraction=args.val_fraction,
         link_mode=args.link_mode,
+        max_image_size=args.max_image_size,
         dry_run=args.dry_run,
         overwrite=args.overwrite,
         preview_count=args.preview_count,
