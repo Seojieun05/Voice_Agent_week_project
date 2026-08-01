@@ -261,6 +261,18 @@ Analyzer에는 서버가 실제 처리한 연속 `processed_index`가 전달됩�
 영상 스트림은 계속 동작하고 명시적인 에러 코드로 응답합니다. 요청/응답 형식과 에러 코드
 전체는 [docs/api_contract.md](docs/api_contract.md)를 참고하세요.
 
+### 핸즈프리 음성 대화 (/ws/audio)
+
+버튼 없이 말로만 대화하는 경로도 있습니다. 클라이언트가 마이크 PCM(16 kHz mono
+int16, 20 ms 프레임)을 `/ws/audio` WebSocket으로 스트리밍하면 서버가 webrtcvad +
+endpointing 상태 머신으로 **말이 끝나는 시점을 스스로 판단**해 xAI STT → 위와 동일한
+chat 흐름 → xAI TTS를 수행하고, TTS 오디오를 청크 단위로 스트리밍해 첫 청크부터
+재생할 수 있게 합니다(time-to-first-audio). 서버 실행 후 Chrome/Edge에서
+`http://localhost:8000/demo/`를 열면 브라우저 테스트 터미널로 전체 흐름을 확인할 수
+있습니다. 끊김 판정 대기 시간은 `VISION_SERVER_SILENCE_MS`(기본 700 ms) 등으로
+조정합니다 — 자세한 프로토콜과 환경변수는 [docs/api_contract.md](docs/api_contract.md)의
+`/ws/audio` 절을 참고하세요.
+
 샘플 MP4 클라이언트는 다음처럼 실행합니다.
 
 ```bash

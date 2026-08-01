@@ -21,6 +21,7 @@ import numpy as np
 try:
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect
     from fastapi.responses import JSONResponse
+    from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
 except ImportError as exc:  # pragma: no cover - exercised by installations without server extras
     raise RuntimeError(
@@ -33,6 +34,7 @@ from .scene_state import SceneSnapshot, SceneStateStore
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .chat import ChatClientProtocol
+    from .voice import SpeechClientProtocol, TurnDetectorProtocol
 
 
 LOGGER = logging.getLogger(__name__)
@@ -50,6 +52,8 @@ class VisionSessionProtocol(Protocol):
 
 SessionFactory = Callable[[], VisionSessionProtocol]
 ChatClientFactory = Callable[[], "ChatClientProtocol"]
+SpeechClientFactory = Callable[[], "SpeechClientProtocol"]
+TurnDetectorFactory = Callable[[], "TurnDetectorProtocol"]
 
 
 def _environment_int(name: str, default: int) -> int:
@@ -111,6 +115,15 @@ class ServerConfig:
     vlm_max_image_dim: int = 1024
     frame_buffer_frames: int = 5
     frame_buffer_max_age_s: float = 10.0
+    # Endpointing knobs for /ws/audio (lecture 3's "patience dial"):
+    # silence_ms of continuous non-speech ends the turn; prefix_ms of audio
+    # before onset is kept so first syllables survive; utterances with less
+    # than min_speech_ms of actual speech are discarded without an API call.
+    silence_ms: int = 700
+    prefix_ms: int = 300
+    min_speech_ms: int = 250
+    vad_aggressiveness: int = 2
+    max_utterance_ms: int = 30_000
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -145,6 +158,16 @@ class ServerConfig:
             raise ValueError("vlm_cooldown_s must be non-negative")
         if not math.isfinite(self.frame_buffer_max_age_s) or self.frame_buffer_max_age_s <= 0.0:
             raise ValueError("frame_buffer_max_age_s must be positive")
+        if self.silence_ms < 1:
+            raise ValueError("silence_ms must be at least 1")
+        if self.prefix_ms < 0:
+            raise ValueError("prefix_ms must not be negative")
+        if self.min_speech_ms < 0:
+            raise ValueError("min_speech_ms must not be negative")
+        if not 0 <= self.vad_aggressiveness <= 3:
+            raise ValueError("vad_aggressiveness must be between 0 and 3")
+        if self.max_utterance_ms <= self.silence_ms:
+            raise ValueError("max_utterance_ms must be greater than silence_ms")
         if self.debug_frame_dir is not None and not isinstance(self.debug_frame_dir, Path):
             object.__setattr__(self, "debug_frame_dir", Path(self.debug_frame_dir))
 
@@ -200,6 +223,11 @@ class ServerConfig:
                 "VISION_SERVER_FRAME_BUFFER_MAX_AGE_S",
                 10.0,
             ),
+            silence_ms=_environment_int("VISION_SERVER_SILENCE_MS", 700),
+            prefix_ms=_environment_int("VISION_SERVER_PREFIX_MS", 300),
+            min_speech_ms=_environment_int("VISION_SERVER_MIN_SPEECH_MS", 250),
+            vad_aggressiveness=_environment_int("VISION_SERVER_VAD_AGGRESSIVENESS", 2),
+            max_utterance_ms=_environment_int("VISION_SERVER_MAX_UTTERANCE_MS", 30_000),
         )
 
 
@@ -1135,23 +1163,71 @@ def _default_chat_client_factory() -> "ChatClientProtocol":
     return GrokChatClient.from_environment()
 
 
+def _default_speech_client_factory() -> "SpeechClientProtocol":
+    # Speech dependencies stay optional for vision-only installations, so the
+    # client is imported only when the audio WebSocket is actually used.
+    from .voice import GrokSpeechClient
+
+    return GrokSpeechClient.from_environment()
+
+
+def _parse_audio_start_message(
+    raw_text: str,
+    config: ServerConfig,
+) -> tuple[str | None, str | None]:
+    """Parse the /ws/audio start message; returns (session_id, error)."""
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return None, "start message is not valid JSON"
+    if not isinstance(payload, dict) or payload.get("type") != "start":
+        return None, "the first message must have type 'start'"
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None, "session_id must be a non-empty string"
+    session_id = session_id.strip()
+    if len(session_id) > config.max_session_id_length:
+        return None, "session_id exceeds the configured maximum length"
+    return session_id, None
+
+
 def create_app(
     config: ServerConfig | None = None,
     session_factory: SessionFactory | None = None,
     chat_client_factory: ChatClientFactory | None = None,
     scene_store: SceneStateStore | None = None,
+    speech_client_factory: SpeechClientFactory | None = None,
+    turn_detector_factory: TurnDetectorFactory | None = None,
 ) -> FastAPI:
     """Create an injectable single-session FastAPI application."""
     server_config = config or ServerConfig.from_environment()
     build_session = session_factory or _default_session_factory(server_config)
     build_chat_client = chat_client_factory or _default_chat_client_factory
+    build_speech_client = speech_client_factory or _default_speech_client_factory
     store = scene_store or SceneStateStore()
     frame_buffer = FrameRingBuffer(max_frames=server_config.frame_buffer_frames)
     vlm_last_called: dict[str, float] = {}
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vision-worker")
     gate = _SingleSessionGate()
+    audio_gate = _SingleSessionGate()
     chat_client: "ChatClientProtocol | None" = None
     chat_client_guard = asyncio.Lock()
+    speech_client: "SpeechClientProtocol | None" = None
+    speech_client_guard = asyncio.Lock()
+
+    def _default_turn_detector() -> "TurnDetectorProtocol":
+        # webrtcvad stays optional for installations that never use audio.
+        from .voice import TurnDetector
+
+        return TurnDetector(
+            silence_ms=server_config.silence_ms,
+            prefix_ms=server_config.prefix_ms,
+            min_speech_ms=server_config.min_speech_ms,
+            vad_aggressiveness=server_config.vad_aggressiveness,
+            max_utterance_ms=server_config.max_utterance_ms,
+        )
+
+    build_turn_detector = turn_detector_factory or _default_turn_detector
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI):
@@ -1160,6 +1236,9 @@ def create_app(
         close = getattr(chat_client, "close", None)
         if callable(close):
             close()
+        speech_close = getattr(speech_client, "close", None)
+        if callable(speech_close):
+            speech_close()
 
     application = FastAPI(title="Voice Agent Vision Server", lifespan=lifespan)
     application.state.server_config = server_config
@@ -1172,6 +1251,13 @@ def create_app(
             if chat_client is None:
                 chat_client = build_chat_client()
             return chat_client
+
+    async def _speech_client() -> "SpeechClientProtocol":
+        nonlocal speech_client
+        async with speech_client_guard:
+            if speech_client is None:
+                speech_client = build_speech_client()
+            return speech_client
 
     @application.get("/health")
     async def health() -> dict[str, object]:
@@ -1189,39 +1275,21 @@ def create_app(
             "created_at_ms": time.time_ns() // 1_000_000,
         }
 
-    @application.post("/api/chat")
-    async def chat(request: _ChatRequest) -> JSONResponse:
+    async def answer_question(session_id: str, question: str) -> tuple[int, dict[str, object]]:
+        """Answer one user question against the session's latest scene state.
+
+        Shared by POST /api/chat and /ws/audio voice turns. Returns an
+        HTTP-style ``(status_code, payload)`` pair so both callers map
+        success and errors identically.
+        """
         from .chat import ChatServiceError
 
-        session_id = request.session_id.strip()
-        question = request.user_question.strip()
-        if not session_id or len(session_id) > server_config.max_session_id_length:
-            return JSONResponse(
-                status_code=400,
-                content=_error_payload("INVALID_SESSION_ID", "session_id is empty or too long"),
-            )
-        if not question:
-            return JSONResponse(
-                status_code=400,
-                content=_error_payload("INVALID_QUESTION", "user_question must not be empty"),
-            )
-        if len(question) > server_config.max_question_length:
-            return JSONResponse(
-                status_code=400,
-                content=_error_payload(
-                    "QUESTION_TOO_LONG",
-                    "user_question exceeds the configured maximum length",
-                ),
-            )
         snapshot = store.snapshot(session_id)
         if snapshot is None:
-            return JSONResponse(
-                status_code=404,
-                content=_error_payload(
-                    "SESSION_NOT_FOUND",
-                    "unknown session_id; create one via POST /api/session "
-                    "or start a /ws/vision stream first",
-                ),
+            return 404, _error_payload(
+                "SESSION_NOT_FOUND",
+                "unknown session_id; create one via POST /api/session "
+                "or start a /ws/vision stream first",
             )
 
         scene_state = snapshot.to_dict()
@@ -1370,28 +1438,45 @@ def create_app(
             # are upstream failures (502). The connection must survive both.
             status_code = 503 if exc.code == "MISSING_API_KEY" else 502
             LOGGER.warning("chat answer failed code=%s", exc.code)
-            return JSONResponse(
-                status_code=status_code,
-                content=_error_payload(exc.code, exc.message),
-            )
+            return status_code, _error_payload(exc.code, exc.message)
         except Exception:
             LOGGER.exception("chat answer failed unexpectedly")
-            return JSONResponse(
-                status_code=500,
-                content=_error_payload("CHAT_FAILED", "chat answer could not be generated"),
-            )
+            return 500, _error_payload("CHAT_FAILED", "chat answer could not be generated")
 
-        return JSONResponse(
-            content={
-                "type": "chat_answer",
-                "session_id": session_id,
-                "answer_text": answer_text,
-                "has_scene_analysis": snapshot.has_analysis,
-                "scene_state_updated_at_ms": snapshot.updated_at_ms,
-                "vlm": vlm_meta,
-                "tool_calls": tool_calls_meta,
-            }
-        )
+        return 200, {
+            "type": "chat_answer",
+            "session_id": session_id,
+            "answer_text": answer_text,
+            "has_scene_analysis": snapshot.has_analysis,
+            "scene_state_updated_at_ms": snapshot.updated_at_ms,
+            "vlm": vlm_meta,
+            "tool_calls": tool_calls_meta,
+        }
+
+    @application.post("/api/chat")
+    async def chat(request: _ChatRequest) -> JSONResponse:
+        session_id = request.session_id.strip()
+        question = request.user_question.strip()
+        if not session_id or len(session_id) > server_config.max_session_id_length:
+            return JSONResponse(
+                status_code=400,
+                content=_error_payload("INVALID_SESSION_ID", "session_id is empty or too long"),
+            )
+        if not question:
+            return JSONResponse(
+                status_code=400,
+                content=_error_payload("INVALID_QUESTION", "user_question must not be empty"),
+            )
+        if len(question) > server_config.max_question_length:
+            return JSONResponse(
+                status_code=400,
+                content=_error_payload(
+                    "QUESTION_TOO_LONG",
+                    "user_question exceeds the configured maximum length",
+                ),
+            )
+        status_code, payload = await answer_question(session_id, question)
+        return JSONResponse(status_code=status_code, content=payload)
 
     @application.websocket("/ws/vision")
     async def vision_websocket(websocket: WebSocket) -> None:
@@ -1739,6 +1824,302 @@ def create_app(
             gate.release()
             if cancellation is not None:
                 raise cancellation
+
+    @application.websocket("/ws/audio")
+    async def audio_websocket(websocket: WebSocket) -> None:
+        """Hands-free voice turns: PCM frames in, transcript + TTS chunks out.
+
+        Wire protocol (all control messages are JSON text; audio is binary):
+
+            client -> server  {"type": "start", "session_id": str}   (first)
+            client -> server  <binary>  640-byte int16 LE PCM frame (20 ms @ 16 kHz)
+            client -> server  {"type": "playback_done"}   (speaker truly done)
+            server -> client  {"type": "ready", "session_id": str}
+            server -> client  {"type": "vad", "speaking": bool}      (UI only)
+            server -> client  {"type": "turn", "duration_ms": int}
+            server -> client  {"type": "transcript", "text": str}
+            server -> client  {"type": "audio_start"}
+            server -> client  <binary>  one encoded TTS chunk (mp3), repeated
+            server -> client  {"type": "audio_end", "reply": str,
+                               "tool_calls": [...], "timings": {...}}
+            server -> client  {"type": "listening"} / {"type": "error", ...}
+
+        While a response is in flight, inbound audio is dropped (the client
+        also mutes its mic during playback — belt and suspenders against the
+        agent hearing itself). Barge-in is deliberately out of scope.
+        """
+        from .voice import FRAME_BYTES, SpeechServiceError
+
+        await websocket.accept()
+        if not await audio_gate.claim():
+            await websocket.send_json(
+                _error_payload(
+                    "SESSION_BUSY",
+                    "another audio session is already active",
+                )
+            )
+            await websocket.close(code=1013)
+            return
+
+        detector: "TurnDetectorProtocol | None" = None
+        respond_task: asyncio.Task[None] | None = None
+        send_lock = asyncio.Lock()
+        responding = False
+        early_playback_done = False
+        received_frames = 0
+        committed_turns = 0
+        audio_session_id: str | None = None
+        session_started_at_s = time.perf_counter()
+
+        async def safe_send(payload: Mapping[str, object]) -> bool:
+            try:
+                async with send_lock:
+                    await websocket.send_json(dict(payload))
+            except (RuntimeError, OSError, WebSocketDisconnect):
+                return False
+            return True
+
+        async def safe_send_bytes(data: bytes) -> bool:
+            try:
+                async with send_lock:
+                    await websocket.send_bytes(data)
+            except (RuntimeError, OSError, WebSocketDisconnect):
+                return False
+            return True
+
+        async def finish_turn() -> None:
+            # Reopen the mic: clear the response gate and any partial detector
+            # state accumulated before it engaged, then tell the client.
+            nonlocal responding
+            responding = False
+            if detector is not None:
+                detector.reset()
+            await safe_send({"type": "listening"})
+
+        async def respond(session_id: str, utterance: bytes) -> None:
+            """One voice turn: STT -> shared chat flow -> streamed TTS relay.
+
+            Every blocking stage runs via asyncio.to_thread: a blocked event
+            loop cannot flush socket writes, so without it the "streamed" TTS
+            chunks would pile up in the transport buffer and arrive at the
+            client as one lump when the pipeline finished.
+            """
+            nonlocal early_playback_done
+            turn_started_at_s = time.perf_counter()
+
+            def elapsed_ms() -> int:
+                return round((time.perf_counter() - turn_started_at_s) * 1000)
+
+            timings: dict[str, int] = {}
+            # 32 bytes of PCM = 1 ms at 16 kHz int16 mono.
+            await safe_send({"type": "turn", "duration_ms": len(utterance) // 32})
+            try:
+                client = await _speech_client()
+                transcript = (await asyncio.to_thread(client.transcribe, utterance)).strip()
+                timings["stt"] = elapsed_ms()
+                if not transcript:
+                    LOGGER.info("voice turn dropped: empty transcript")
+                    await finish_turn()
+                    return
+                if len(transcript) > server_config.max_question_length:
+                    transcript = transcript[: server_config.max_question_length]
+                await safe_send({"type": "transcript", "text": transcript})
+                LOGGER.info(
+                    "voice turn transcribed chars=%s stt_ms=%s",
+                    len(transcript),
+                    timings["stt"],
+                )
+
+                status_code, payload = await answer_question(session_id, transcript)
+                timings["llm"] = elapsed_ms() - timings["stt"]
+                if status_code != 200:
+                    await safe_send(payload)
+                    await finish_turn()
+                    return
+                answer_text = str(payload.get("answer_text") or "")
+
+                await safe_send({"type": "audio_start"})
+                first_chunk_ms: int | None = None
+                chunks = client.synthesize(answer_text)
+                try:
+                    # next() on the streaming response blocks too — same rule.
+                    while (chunk := await asyncio.to_thread(next, chunks, None)) is not None:
+                        if first_chunk_ms is None:
+                            first_chunk_ms = elapsed_ms()
+                            timings["tts_first"] = first_chunk_ms - timings["stt"] - timings["llm"]
+                        if not await safe_send_bytes(chunk):
+                            return
+                finally:
+                    closer = getattr(chunks, "close", None)
+                    if callable(closer):
+                        await asyncio.to_thread(closer)
+                timings["tts_total"] = elapsed_ms() - timings["stt"] - timings["llm"]
+                timings["total"] = elapsed_ms()
+                await safe_send(
+                    {
+                        "type": "audio_end",
+                        "reply": answer_text,
+                        "tool_calls": payload.get("tool_calls", []),
+                        "timings": timings,
+                    }
+                )
+                LOGGER.info(
+                    "voice turn answered chars=%s timings=%s",
+                    len(answer_text),
+                    timings,
+                )
+                if early_playback_done:
+                    # The client reported playback done (an early player
+                    # error) before the relay finished; apply it now.
+                    early_playback_done = False
+                    await finish_turn()
+            except asyncio.CancelledError:
+                raise
+            except SpeechServiceError as exc:
+                LOGGER.warning("voice turn failed code=%s", exc.code)
+                await safe_send(_error_payload(exc.code, exc.message))
+                await finish_turn()
+            except Exception:
+                LOGGER.exception("voice turn failed unexpectedly")
+                await safe_send(
+                    _error_payload(
+                        "VOICE_TURN_FAILED",
+                        "voice turn could not be completed",
+                    )
+                )
+                await finish_turn()
+
+        try:
+            initial_message = await websocket.receive()
+            if initial_message.get("type") == "websocket.disconnect":
+                return
+            raw_start = initial_message.get("text")
+            if not isinstance(raw_start, str):
+                await safe_send(
+                    _error_payload(
+                        "INVALID_START",
+                        "the first message must be a JSON start message",
+                    )
+                )
+                await websocket.close(code=1008)
+                return
+            parsed_session_id, start_error = _parse_audio_start_message(
+                raw_start,
+                server_config,
+            )
+            if parsed_session_id is None:
+                await safe_send(
+                    _error_payload("INVALID_START", start_error or "invalid start message")
+                )
+                await websocket.close(code=1008)
+                return
+            audio_session_id = parsed_session_id
+
+            try:
+                detector = build_turn_detector()
+            except Exception:
+                LOGGER.exception("turn detector initialization failed")
+                await safe_send(
+                    _error_payload(
+                        "SESSION_INITIALIZATION_FAILED",
+                        "audio session could not be initialized",
+                    )
+                )
+                await websocket.close(code=1011)
+                return
+
+            # Same behavior as /ws/vision: a client-chosen session_id is
+            # registered so voice-only use works without POST /api/session.
+            store.register(audio_session_id)
+            LOGGER.info(
+                "audio session started session_id=%s silence_ms=%s prefix_ms=%s "
+                "min_speech_ms=%s vad_aggressiveness=%s",
+                audio_session_id,
+                server_config.silence_ms,
+                server_config.prefix_ms,
+                server_config.min_speech_ms,
+                server_config.vad_aggressiveness,
+            )
+            await safe_send({"type": "ready", "session_id": audio_session_id})
+
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    break
+                raw_binary = message.get("bytes")
+                raw_text = message.get("text")
+
+                if raw_binary is not None:
+                    received_frames += 1
+                    if responding:
+                        continue  # speech during a response is dropped
+                    if len(raw_binary) != FRAME_BYTES:
+                        continue  # partial frame on connect/teardown; ignore
+                    was_speaking = detector.speaking
+                    utterance = detector.feed(raw_binary)
+                    if detector.speaking != was_speaking:
+                        if not await safe_send({"type": "vad", "speaking": detector.speaking}):
+                            break
+                    if utterance is not None:
+                        responding = True
+                        early_playback_done = False
+                        committed_turns += 1
+                        respond_task = asyncio.create_task(respond(audio_session_id, utterance))
+                    continue
+
+                if not isinstance(raw_text, str):
+                    continue
+                try:
+                    parsed = json.loads(raw_text)
+                except json.JSONDecodeError:
+                    if not await safe_send(
+                        _error_payload("INVALID_MESSAGE", "control messages must be JSON")
+                    ):
+                        break
+                    continue
+                message_type = parsed.get("type") if isinstance(parsed, dict) else None
+                if message_type == "playback_done":
+                    # ≈ a telephony provider's "mark" event: the client's
+                    # speaker is actually done, so the mic can reopen.
+                    if respond_task is not None and not respond_task.done():
+                        early_playback_done = True
+                        continue
+                    await finish_turn()
+                    continue
+                if not await safe_send(
+                    _error_payload(
+                        "INVALID_MESSAGE",
+                        f"unsupported message type: {message_type}",
+                    )
+                ):
+                    break
+        finally:
+            cancellation: asyncio.CancelledError | None = None
+            if respond_task is not None:
+                respond_task.cancel()
+                cancellation = await _wait_shielded(
+                    respond_task,
+                    "voice respond task failed during disconnect",
+                )
+                if respond_task.cancelled():
+                    # The cancellation we requested ourselves, not the
+                    # endpoint's own; do not re-raise it.
+                    cancellation = None
+            LOGGER.info(
+                "audio session ended session_id=%s frames=%s turns=%s elapsed_s=%.3f",
+                audio_session_id,
+                received_frames,
+                committed_turns,
+                time.perf_counter() - session_started_at_s,
+            )
+            audio_gate.release()
+            if cancellation is not None:
+                raise cancellation
+
+    demo_dir = Path(__file__).resolve().parent / "static"
+    if demo_dir.is_dir():
+        # Browser test terminal for /ws/audio at /demo/ (no client build needed).
+        application.mount("/demo", StaticFiles(directory=str(demo_dir), html=True), name="demo")
 
     return application
 
