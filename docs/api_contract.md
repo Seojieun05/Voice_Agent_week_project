@@ -22,6 +22,15 @@
  → answer_text 수신 → Android TTS로 재생
 ```
 
+핸즈프리 대안 — 앱(또는 브라우저)이 STT/TTS 없이 원시 오디오만 스트리밍:
+
+```
+ → WS /ws/audio (start에 같은 session_id 사용)
+     마이크 PCM 프레임 전송 → 서버가 턴 종료 판단(VAD+endpointing)
+     → 서버 STT → chat 흐름 → TTS 오디오 청크 수신 → 재생
+     → 재생 완료 시 playback_done 전송
+```
+
 `session_id`는 두 경로를 잇는 열쇠다. `/ws/vision`의 `start.session_id`와 `/api/chat`의 `session_id`가 같아야 서버가 최신 장면 분석 결과를 질문에 결합한다.
 
 참고: `/ws/vision`의 `start`에 임의의 session_id를 보내도 서버가 그 세션을 자동 등록하므로, `/api/session` 없이 스트림만으로도 `/api/chat`을 쓸 수 있다. 다만 앱은 `/api/session`으로 발급받은 ID를 쓰는 것을 권장한다.
@@ -187,6 +196,74 @@
 
 Grok 호출이 실패해도 서버와 `/ws/vision` 스트림은 계속 동작한다.
 
+## WebSocket /ws/audio
+
+핸즈프리 음성 대화. 클라이언트가 마이크 오디오를 연속 스트리밍하면 **서버가
+말이 끝나는 시점을 스스로 판단**(VAD + endpointing)해 STT → `/api/chat`과 동일한
+답변 흐름 → TTS를 수행하고, TTS 오디오를 청크 단위로 되돌려준다. 버튼이나
+푸시투톡이 필요 없다.
+
+오디오 계약(고정): **mono int16 little-endian, 16 kHz, 20 ms 프레임(640바이트)**.
+제어 메시지는 JSON 텍스트, 오디오는 바이너리 메시지다. 동시 오디오 세션은
+1개만 허용된다(`/ws/vision`의 세션 제한과는 별개).
+
+1. 연결 직후 텍스트 메시지로 start를 보낸다 (`/ws/vision`과 같은 session_id를
+   쓰면 최신 장면 분석이 답변에 결합된다):
+
+```json
+{ "type": "start", "session_id": "b81c9f52..." }
+```
+
+서버 응답: `{ "type": "ready", "session_id": "..." }`. 알 수 없는 session_id는
+`/ws/vision`과 동일하게 자동 등록된다(장면 정보 없이 동작).
+
+2. 이후 클라이언트는 640바이트 PCM 프레임을 바이너리로 계속 보낸다(~50/초).
+   크기가 틀린 프레임은 조용히 무시된다.
+
+3. 서버 → 클라이언트 메시지 (한 턴의 순서):
+
+| 메시지 | 의미 |
+| --- | --- |
+| `{ "type": "vad", "speaking": bool }` | 음성 감지 상태 변화 (UI 표시용) |
+| `{ "type": "turn", "duration_ms": int }` | 턴 종료 판정 — 발화 길이(ms) |
+| `{ "type": "transcript", "text": "..." }` | STT 결과 |
+| `{ "type": "audio_start" }` | TTS 스트리밍 시작 — 클라이언트는 마이크를 닫는다 |
+| (바이너리) | TTS mp3 청크, 도착 즉시 재생 가능 |
+| `{ "type": "audio_end", "reply": "...", "tool_calls": [...], "timings": {...} }` | 답변 텍스트·도구 목록·단계별 지연(ms: stt/llm/tts_first/tts_total/total) |
+| `{ "type": "listening" }` | 마이크를 다시 열어도 됨 |
+
+4. 재생이 **실제로 끝나면** 클라이언트는 `{ "type": "playback_done" }`을 보낸다
+   (전화망의 mark 이벤트에 해당). 서버는 그때까지 수신 오디오를 버리므로,
+   에이전트가 자기 목소리를 듣고 반응하는 에코 루프가 차단된다. 클라이언트도
+   재생 중에는 마이크 전송을 멈추는 것을 권장한다(이중 방어).
+
+5. 응답 중 도착한 사용자 음성은 버려진다(barge-in 미지원 — 향후 확장).
+   턴 처리 실패(STT/Grok/TTS)는 `error` 메시지 + `listening`으로 통지되며 연결은
+   유지된다. 주요 코드: `STT_TIMEOUT`/`STT_ERROR`/`STT_UNAVAILABLE`,
+   `TTS_TIMEOUT`/`TTS_ERROR`/`TTS_UNAVAILABLE`, `/api/chat`과 동일한 chat 계열
+   코드, `VOICE_TURN_FAILED`. 연결 수준 오류: `INVALID_START`(close 1008),
+   `SESSION_BUSY`(close 1013), `SESSION_INITIALIZATION_FAILED`(close 1011).
+
+브라우저 테스트 페이지가 `http://<server>:<port>/demo/`에 있다 (Chrome/Edge,
+마이크 필요). 서버 실행 후 페이지를 열고 그냥 말하면 전체 흐름을 확인할 수 있다.
+발화 오디오는 STT 호출에만 사용되고 디스크나 로그에 저장되지 않는다.
+
+## 서버 환경변수 (음성 관련)
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `TTS_VOICE` | `ara` | xAI TTS 목소리 (ara/eve/leo/rex/sal) |
+| `TTS_LANGUAGE` | `auto` | TTS 언어 힌트 |
+| `GROK_STT_TIMEOUT_S` | `20` | STT 호출 타임아웃(초) |
+| `GROK_TTS_TIMEOUT_S` | `30` | TTS 호출 타임아웃(초) |
+| `VISION_SERVER_SILENCE_MS` | `700` | 이만큼 연속 무음이면 턴 종료 ("patience dial" — 낮추면 빠르지만 말을 끊고, 높이면 안 끊지만 응답이 늦다) |
+| `VISION_SERVER_PREFIX_MS` | `300` | 발화 시작 전 보존할 오디오 (첫 음절 잘림 방지) |
+| `VISION_SERVER_MIN_SPEECH_MS` | `250` | 실제 음성이 이보다 짧으면 버림 (기침·소음이 API 호출로 이어지는 것 방지) |
+| `VISION_SERVER_VAD_AGGRESSIVENESS` | `2` | webrtcvad 민감도 0(관대)~3(엄격) |
+| `VISION_SERVER_MAX_UTTERANCE_MS` | `30000` | 발화 최대 길이 — 초과 시 강제 턴 종료 |
+
+STT/TTS는 chat과 같은 `GROK_API_KEY`(또는 `XAI_API_KEY`)와 `GROK_BASE_URL`을 쓴다.
+
 ## 서버 환경변수 (chat 관련)
 
 | 변수 | 기본값 | 설명 |
@@ -211,6 +288,6 @@ Grok 호출이 실패해도 서버와 `/ws/vision` 스트림은 계속 동작한
 
 ## 향후 확장 (아직 미구현)
 
-- `WS /ws/audio`: 음성 chunk 업로드 → 서버 STT → `/api/chat`과 동일 흐름
-- 서버측 TTS 음성 응답
+- barge-in: 에이전트 응답 중 사용자가 끼어들면 재생을 즉시 멈추고 새 턴으로 처리
+- `/ws/audio` 대화 기억(멀티턴 컨텍스트)
 - 인증/세션 토큰

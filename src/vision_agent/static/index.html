@@ -1,0 +1,381 @@
+<!doctype html>
+<!--
+  /ws/audio 핸즈프리 음성 테스트 터미널.
+
+    IN:  getUserMedia -> AudioWorklet -> float32 @ 16 kHz -> int16 -> 20 ms
+         프레임(640바이트) -> 바이너리 WebSocket 메시지 (~50/초)
+    OUT: 서버가 릴레이하는 TTS mp3 청크가 같은 소켓의 바이너리 메시지로 도착
+         -> MediaSource 버퍼 -> 첫 청크부터 재생 (time-to-first-audio)
+
+  세션: 비워두면 POST /api/session 으로 새로 발급. 폰에서 /ws/vision 을
+  스트리밍 중인 session_id 를 입력하면 장면 인지 답변을 받는다.
+
+  Chrome/Edge 권장: 16 kHz AudioContext 와 MediaSource('audio/mpeg') 필요.
+  MSE 미지원 브라우저는 blob 재생으로 폴백(조기 재생만 포기).
+-->
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Agent — 핸즈프리 음성 테스트</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #181b24; --text: #e8eaf0; --dim: #8b90a0;
+    --stt: #4e9af1; --llm: #b17ce8; --tts: #4ecf8a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; background: var(--bg); color: var(--text);
+    font: 16px/1.5 system-ui, sans-serif; padding: 2rem 1rem;
+  }
+  h1 { font-size: 1.2rem; font-weight: 600; margin: 0 0 .25rem; }
+  #status { color: var(--dim); min-height: 1.5em; margin-bottom: 1rem; }
+  #session {
+    display: flex; gap: .5rem; align-items: center; margin-bottom: 1.2rem;
+    font-size: .85rem; color: var(--dim);
+  }
+  #sid {
+    background: var(--panel); border: 1px solid #3a3f4e; color: var(--text);
+    border-radius: 8px; padding: .35rem .6rem; width: 17rem;
+    font: .8rem ui-monospace, monospace;
+  }
+
+  /* 상태 orb: 턴테이킹 상태 머신의 표시등 */
+  #orb {
+    width: 9rem; height: 9rem; border-radius: 50%; border: none;
+    color: #fff; font: 600 .95rem system-ui; cursor: pointer;
+    background: #3a3f4e; transition: background .2s, box-shadow .2s;
+  }
+  #orb.listening { background: #2e3442; }
+  #orb.hearing   { background: var(--stt);  box-shadow: 0 0 0 12px rgba(78,154,241,.22); }
+  #orb.thinking  { background: var(--llm);  box-shadow: 0 0 0 8px  rgba(177,124,232,.22); }
+  #orb.speaking  { background: var(--tts);  box-shadow: 0 0 0 12px rgba(78,207,138,.22); }
+  @keyframes breathe { 50% { box-shadow: 0 0 0 18px rgba(78,154,241,.10); } }
+  #orb.hearing { animation: breathe 1.2s ease-in-out infinite; }
+
+  #controls { margin-top: 1rem; display: flex; gap: .6rem; }
+  #controls button {
+    background: none; border: 1px solid #3a3f4e; color: var(--dim);
+    border-radius: 8px; padding: .35rem .9rem; font: 500 .85rem system-ui; cursor: pointer;
+  }
+  #controls button:hover { color: var(--text); border-color: var(--dim); }
+
+  #log { width: 100%; max-width: 40rem; margin-top: 2rem; }
+  .turn { background: var(--panel); border-radius: 10px; padding: .8rem 1rem; margin-bottom: .8rem; }
+  .turn .who { font-size: .75rem; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); }
+  .turn .err { color: #ff7a6b; white-space: pre-wrap; }
+  .tools { margin-top: .6rem; }
+  .tools span {
+    display: inline-block; font: 500 .75rem ui-monospace, monospace;
+    background: rgba(78,207,138,.12); color: var(--tts);
+    border: 1px solid rgba(78,207,138,.4); border-radius: 999px;
+    padding: .15rem .6rem; margin-right: .4rem;
+  }
+  .lat { display: flex; height: 10px; border-radius: 5px; overflow: hidden; margin-top: .6rem; }
+  .lat span { display: block; }
+  .lat .stt { background: var(--stt); } .lat .llm { background: var(--llm); }
+  .lat .tts { background: var(--tts); } .lat .other { background: #555b6e; }
+  .latlabel { font-size: .75rem; color: var(--dim); margin-top: .3rem; }
+  .key { color: var(--dim); font-size: .75rem; margin-top: 1rem; }
+  .key i { display: inline-block; width: .7em; height: .7em; border-radius: 2px; margin: 0 .3em 0 1em; }
+</style>
+</head>
+<body>
+  <h1>Voice Agent — 핸즈프리 음성 테스트</h1>
+  <div id="status">시작을 누르고 마이크를 허용한 뒤, 그냥 말하세요.</div>
+  <div id="session">
+    <label for="sid">session_id (선택)</label>
+    <input id="sid" placeholder="비우면 새 세션 발급 · 비전 세션 ID 입력 가능">
+  </div>
+
+  <button id="orb">시작</button>
+  <div id="controls">
+    <button id="mute" hidden>🎙 음소거</button>
+    <button id="clear" hidden>✕ 기록 지우기</button>
+  </div>
+  <div class="key">
+    지연시간: <i style="background:var(--stt)"></i>STT
+    <i style="background:var(--llm)"></i>Grok (도구 포함)
+    <i style="background:var(--tts)"></i>TTS 첫 청크
+    <i style="background:#555b6e"></i>나머지 오디오
+  </div>
+
+  <div id="log"></div>
+  <audio id="player"></audio>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const status = (msg) => { $("status").textContent = msg; };
+
+const SAMPLE_RATE = 16000;
+const FRAME_SAMPLES = 320;                 // 20 ms @ 16 kHz — 서버 프레임 계약
+
+let ws = null;
+let sessionId = null;
+let state = "idle";                        // idle|listening|hearing|thinking|speaking
+let muted = false;
+let tTurnEnd = 0;                          // 서버가 턴 종료를 선언한 시각
+let tFirstAudio = 0;                       // 응답 음성이 실제로 재생되기 시작한 시각
+let pendingTurn = null;                    // 조립 중인 로그 항목
+
+function setState(s, label) {
+  state = s;
+  $("orb").className = s;
+  $("orb").textContent = label;
+}
+
+// ---------------------------------------------------------------------------
+// 1. 캡처: 마이크 -> AudioWorklet -> 20 ms int16 프레임 -> WebSocket(바이너리).
+//    echoCancellation 은 필수: 끄면 스피커로 나온 에이전트 목소리가 마이크로
+//    되돌아와 VAD 를 스스로 울린다.
+// ---------------------------------------------------------------------------
+async function start() {
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+  } catch (e) {
+    status("마이크 권한이 거부됐습니다 (localhost/HTTPS 필요): " + e.message);
+    return;
+  }
+
+  const ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
+  if (ctx.sampleRate !== SAMPLE_RATE) {
+    status(`브라우저가 ${ctx.sampleRate} Hz를 반환 — 16000 Hz가 필요합니다. Chrome/Edge를 쓰세요.`);
+    return;
+  }
+  await ctx.audioWorklet.addModule("worklet.js");
+  const source = ctx.createMediaStreamSource(stream);
+  const capture = new AudioWorkletNode(ctx, "pcm-capture");
+  source.connect(capture);
+  capture.port.onmessage = (e) => sendSamples(e.data);
+
+  // 자동재생 정책: 클릭 안에서 <audio>를 먼저 언락한다.
+  $("player").play().catch(() => {});
+
+  const entered = $("sid").value.trim();
+  if (entered) {
+    sessionId = entered;
+  } else {
+    try {
+      const resp = await fetch("/api/session", { method: "POST" });
+      sessionId = (await resp.json()).session_id;
+    } catch (e) {
+      status("세션 발급 실패: " + e.message);
+      return;
+    }
+  }
+  $("sid").value = sessionId;
+  $("sid").disabled = true;
+  connect();
+
+  $("orb").disabled = true;                // orb는 이제 상태 표시등
+  $("mute").hidden = $("clear").hidden = false;
+  status("연결 중…");
+}
+
+// worklet 블록(128샘플)을 정확한 20 ms 프레임으로 모아 float32 [-1,1] ->
+// int16 LE 변환 후 바이너리로 전송한다.
+let pcmBuf = new Float32Array(0);
+function sendSamples(block) {
+  if (muted || state === "speaking") return;   // 에코 방지의 브라우저 쪽 절반
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  const joined = new Float32Array(pcmBuf.length + block.length);
+  joined.set(pcmBuf); joined.set(block, pcmBuf.length);
+  pcmBuf = joined;
+
+  while (pcmBuf.length >= FRAME_SAMPLES) {
+    const frame = pcmBuf.subarray(0, FRAME_SAMPLES);
+    pcmBuf = pcmBuf.slice(FRAME_SAMPLES);
+    const int16 = new Int16Array(FRAME_SAMPLES);
+    for (let i = 0; i < FRAME_SAMPLES; i++) {
+      const s = Math.max(-1, Math.min(1, frame[i]));       // 클램프: 넘치면 찢어진다
+      int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    ws.send(int16.buffer);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 2. 소켓: 연결 하나로 양방향. 제어는 JSON 텍스트, 오디오는 바이너리.
+// ---------------------------------------------------------------------------
+function connect() {
+  ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/audio`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => ws.send(JSON.stringify({ type: "start", session_id: sessionId }));
+  ws.onclose = () => { setState("idle", "연결 끊김"); status("연결이 끊겼습니다 — 새로고침하세요."); };
+  ws.onmessage = (e) => {
+    if (e.data instanceof ArrayBuffer) enqueueChunk(new Uint8Array(e.data));
+    else handle(JSON.parse(e.data));
+  };
+}
+
+function handle(msg) {
+  switch (msg.type) {
+    case "ready":
+      setState("listening", "듣는 중");
+      status("핸즈프리 모드. “지금 앞에 뭐가 보여?”라고 물어보세요.");
+      break;
+    case "vad":
+      if (state === "listening" || state === "hearing")
+        setState(msg.speaking ? "hearing" : "listening",
+                 msg.speaking ? "말하는 중" : "듣는 중");
+      break;
+    case "turn":
+      tTurnEnd = performance.now();
+      pendingTurn = { youMs: msg.duration_ms };
+      setState("thinking", "생각 중");
+      break;
+    case "transcript":
+      pendingTurn && (pendingTurn.transcript = msg.text);
+      break;
+    case "audio_start":
+      setState("speaking", "응답 중");       // sendSamples의 마이크 게이트도 겸한다
+      startPlayback();
+      break;
+    case "audio_end":
+      Object.assign(pendingTurn ?? {}, {
+        reply: msg.reply, tools: msg.tool_calls, timings: msg.timings,
+      });
+      finishPlayback();
+      logTurn();   // 스트리밍이라 첫 오디오와 audio_end 중 늦게 온 쪽에서 기록
+      break;
+    case "listening":
+      setState("listening", "듣는 중");
+      break;
+    case "error":
+      addTurn({ error: `${msg.code ?? "ERROR"}: ${msg.message ?? ""}` });
+      pendingTurn = null;
+      break;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 3. 스트리밍 재생: MediaSource는 재생 중인 요소에 청크를 계속 붙일 수 있다.
+//    MSE가 없으면 청크를 모아 blob으로 재생(조기 재생만 포기).
+// ---------------------------------------------------------------------------
+const useMSE = "MediaSource" in window && MediaSource.isTypeSupported("audio/mpeg");
+let mediaSource = null, sourceBuf = null, chunkQueue = [], streamEnded = false;
+let blobChunks = [];
+
+function startPlayback() {
+  tFirstAudio = 0;
+  const player = $("player");
+  player.onplaying = () => { if (!tFirstAudio) { tFirstAudio = performance.now(); logTurn(); } };
+  player.onended = playbackDone;
+  player.onerror = playbackDone;           // 서버가 영원히 기다리지 않도록
+
+  if (!useMSE) { blobChunks = []; return; }
+  chunkQueue = []; streamEnded = false; sourceBuf = null;
+  mediaSource = new MediaSource();
+  player.src = URL.createObjectURL(mediaSource);
+  mediaSource.addEventListener("sourceopen", () => {
+    sourceBuf = mediaSource.addSourceBuffer("audio/mpeg");
+    sourceBuf.addEventListener("updateend", pump);
+    pump();
+  }, { once: true });
+  player.play().catch(() => status("자동재생이 차단됨 — 페이지를 클릭한 뒤 다시 말하세요."));
+}
+
+function enqueueChunk(bytes) {
+  if (useMSE) { chunkQueue.push(bytes); pump(); }
+  else blobChunks.push(bytes);
+}
+
+function pump() {
+  if (!sourceBuf || sourceBuf.updating) return;
+  if (chunkQueue.length) sourceBuf.appendBuffer(chunkQueue.shift());
+  else if (streamEnded && mediaSource.readyState === "open") mediaSource.endOfStream();
+}
+
+function finishPlayback() {
+  if (useMSE) {
+    streamEnded = true;
+    // 청크가 오기 전에 플레이어가 이미 실패했다면 mark를 다시 보낸다.
+    if ($("player").error) playbackDone();
+    else pump();
+    return;
+  }
+  const player = $("player");
+  player.src = URL.createObjectURL(new Blob(blobChunks, { type: "audio/mpeg" }));
+  player.play().catch(() => status("자동재생이 차단됨 — 페이지를 클릭한 뒤 다시 말하세요."));
+}
+
+function playbackDone() {
+  // ≈ 전화망의 "mark" 이벤트: 스피커 재생이 진짜 끝났으니 마이크를 다시
+  // 열어도 안전하다고 서버에 알린다. 서버가 "listening"을 줄 때까지
+  // 마이크는 게이트된 상태(state === "speaking")로 남는다.
+  if (ws && ws.readyState === WebSocket.OPEN)
+    ws.send(JSON.stringify({ type: "playback_done" }));
+}
+
+// ---------------------------------------------------------------------------
+// 4. 턴 로그 — time-to-first-audio 포함.
+// ---------------------------------------------------------------------------
+function logTurn() {
+  if (!pendingTurn || !pendingTurn.timings || !tFirstAudio) return;
+  const t = pendingTurn;
+  t.firstAudioMs = Math.round(tFirstAudio - tTurnEnd);
+  addTurn(t);
+  pendingTurn = null;
+}
+
+function addTurn({ transcript, reply, tools = [], timings = {}, firstAudioMs, error }) {
+  const div = document.createElement("div");
+  div.className = "turn";
+
+  if (error) {
+    div.innerHTML = `<div class="who">서버 오류</div><div class="err"></div>`;
+    div.querySelector(".err").textContent = error;
+  } else {
+    div.innerHTML = `
+      <div class="who">나</div><div></div>
+      <div class="who" style="margin-top:.5rem">에이전트</div><div></div>
+      <div class="tools"></div>
+      <div class="lat"></div><div class="latlabel"></div>`;
+    const texts = div.querySelectorAll("div:not([class])");
+    texts[0].textContent = transcript ?? "(인식된 텍스트 없음)";
+    texts[1].textContent = reply ?? "";
+
+    const toolsEl = div.querySelector(".tools");
+    for (const t of tools ?? []) {
+      const chip = document.createElement("span");
+      chip.textContent = "🔧 " + (t.name ?? t);
+      toolsEl.appendChild(chip);
+    }
+    if (!(tools ?? []).length) toolsEl.remove();
+
+    const { stt = 0, llm = 0, tts_first = 0, tts_total = 0 } = timings;
+    const total = Math.max(firstAudioMs || 0, stt + llm + tts_first, 1);
+    const other = Math.max(total - stt - llm - tts_first, 0);
+    const bar = div.querySelector(".lat");
+    for (const [cls, ms] of [["stt", stt], ["llm", llm], ["tts", tts_first], ["other", other]]) {
+      const seg = document.createElement("span");
+      seg.className = cls;
+      seg.style.width = (100 * ms / total) + "%";
+      bar.appendChild(seg);
+    }
+    div.querySelector(".latlabel").textContent =
+      `말이 끝나고 ${firstAudioMs} ms 뒤 음성 시작 ` +
+      `(STT ${stt} · Grok ${llm} · TTS 첫 청크 ${tts_first} — 전체 TTS ${tts_total} ms: ` +
+      `스트리밍으로 ~${Math.max(tts_total - tts_first, 0)} ms 아낌)`;
+  }
+  $("log").prepend(div);
+}
+
+// ---------------------------------------------------------------------------
+// 5. 컨트롤.
+// ---------------------------------------------------------------------------
+$("orb").addEventListener("click", start, { once: true });
+$("mute").addEventListener("click", () => {
+  muted = !muted;
+  $("mute").textContent = muted ? "🎙 음소거 해제" : "🎙 음소거";
+  status(muted ? "마이크 음소거됨." : "핸즈프리 모드. 그냥 말하세요.");
+});
+$("clear").addEventListener("click", () => { $("log").innerHTML = ""; });
+</script>
+</body>
+</html>
