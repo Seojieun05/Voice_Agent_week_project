@@ -229,7 +229,7 @@ Grok 호출이 실패해도 서버와 `/ws/vision` 스트림은 계속 동작한
 | `{ "type": "transcript", "text": "..." }` | STT 결과 |
 | `{ "type": "audio_start" }` | TTS 스트리밍 시작 — 클라이언트는 마이크를 닫는다 |
 | (바이너리) | TTS mp3 청크, 도착 즉시 재생 가능 |
-| `{ "type": "audio_end", "reply": "...", "tool_calls": [...], "timings": {...} }` | 답변 텍스트·도구 목록·단계별 지연(ms: stt/llm/tts_first/tts_total/total) |
+| `{ "type": "audio_end", "reply": "...", "tool_calls": [...], "timings": {...} }` | 답변 텍스트·도구 목록·단계별 지연(ms: stt/llm/tts_first/tts_total/total; 추측 STT 결과가 재사용된 턴에는 `stt_speculative: 1`이 추가되고 stt는 잔여 대기 시간만 반영) |
 | `{ "type": "interrupted" }` | 끼어들기(barge-in) 확정 — 서버가 응답을 취소했다. 아래 5 참조 |
 | `{ "type": "listening" }` | 마이크를 다시 열어도 됨 |
 
@@ -252,7 +252,15 @@ Grok 호출이 실패해도 서버와 `/ws/vision` 스트림은 계속 동작한
    `VISION_SERVER_BARGE_IN=0`이면 기존 동작(응답 중 수신 오디오 폐기)으로
    되돌아가며 `interrupted`는 발생하지 않는다.
 
-6. 턴 처리 실패(STT/Grok/TTS)는 `error` 메시지 + `listening`으로 통지되며 연결은
+6. **추측 STT(speculative STT, 기본 활성)**: 무음이 `VISION_SERVER_SPECULATIVE_STT_MS`
+   (기본 350 ms)에 도달하면 서버는 턴 종료 확정(`SILENCE_MS`, 기본 700 ms)을
+   기다리지 않고 지금까지의 오디오로 STT를 미리 시작한다. 그대로 턴이 끝나면
+   결과를 재사용해 무음 대기와 STT 왕복이 겹쳐지고(체감 지연 감소), 사용자가
+   말을 이어가면 미리 한 호출은 버려진다(STT 호출 1회 낭비). 와이어 프로토콜에는
+   아무 변화가 없다 — 클라이언트는 신경 쓸 것이 없고, 재사용 여부는 `audio_end`의
+   `timings.stt_speculative`로만 관찰된다. `0`이면 비활성.
+
+7. 턴 처리 실패(STT/Grok/TTS)는 `error` 메시지 + `listening`으로 통지되며 연결은
    유지된다. 주요 코드: `STT_TIMEOUT`/`STT_ERROR`/`STT_UNAVAILABLE`,
    `TTS_TIMEOUT`/`TTS_ERROR`/`TTS_UNAVAILABLE`, `/api/chat`과 동일한 chat 계열
    코드, `VOICE_TURN_FAILED`. 연결 수준 오류: `INVALID_START`(close 1008),
@@ -278,6 +286,7 @@ Grok 호출이 실패해도 서버와 `/ws/vision` 스트림은 계속 동작한
 | `VISION_SERVER_VAD_THRESHOLD` | `0.5` | silero 발화 판정 확률 문턱 (0~1] |
 | `VISION_SERVER_VAD_GUARD_THRESHOLD` | `0.75` | 에코 가드(TTS 재생 중) 상향 문턱 — threshold 이상이어야 한다 |
 | `VISION_SERVER_MAX_UTTERANCE_MS` | `30000` | 발화 최대 길이 — 초과 시 강제 턴 종료 |
+| `VISION_SERVER_SPECULATIVE_STT_MS` | `350` | 무음이 이만큼 쌓이면 STT를 미리 시작(추측 STT) — SILENCE_MS보다 작아야 하며 `0`이면 비활성 |
 | `VISION_SERVER_BARGE_IN` | `1` | 끼어들기(barge-in) 활성 여부 — `0`/`false`만 비활성(응답 중 수신 오디오 폐기로 복귀) |
 
 STT/TTS는 chat과 같은 `GROK_API_KEY`(또는 `XAI_API_KEY`)와 `GROK_BASE_URL`을 쓴다.

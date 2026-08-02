@@ -24,34 +24,66 @@ class _FakeSession:
 
 
 class _FakeTurnDetector:
-    """Scripted endpointing: commits a turn after ``commit_after`` frames."""
+    """Scripted endpointing: commits a turn after ``commit_after`` frames.
 
-    def __init__(self, commit_after: int = 3) -> None:
+    ``speculate_after`` scripts speculative STT: after that many frames of a
+    turn, ``take_speculative()`` offers the audio so far. ``speculation_valid``
+    controls whether the commit then reports that candidate as still matching
+    the turn (``committed_speculation``), as the real detector does when the
+    triggering pause runs to commit uninterrupted.
+    """
+
+    def __init__(
+        self,
+        commit_after: int = 3,
+        speculate_after: int | None = None,
+        speculation_valid: bool = True,
+    ) -> None:
         self.commit_after = commit_after
+        self.speculate_after = speculate_after
+        self.speculation_valid = speculation_valid
         self.speaking = False
         self.echo_guard = False
+        self.committed_speculation: int | None = None
         self.fed: list[bytes] = []
         # The guard state observed at each feed(): lets tests verify that
         # response-window frames were heard through the raised anti-echo bar.
         self.guard_log: list[bool] = []
         self.resets = 0
         self._buffer: list[bytes] = []
+        self._generation = 0
+        self._pending: tuple[int, bytes] | None = None
+        self._live: int | None = None
 
     def feed(self, frame: bytes) -> bytes | None:
         self.fed.append(frame)
         self.guard_log.append(self.echo_guard)
         self._buffer.append(frame)
         self.speaking = True
+        if self.speculate_after is not None and len(self._buffer) == self.speculate_after:
+            self._generation += 1
+            self._pending = (self._generation, b"".join(self._buffer))
+            self._live = self._generation
         if len(self._buffer) >= self.commit_after:
             utterance = b"".join(self._buffer)
             self._buffer = []
             self.speaking = False
+            self.committed_speculation = self._live if self.speculation_valid else None
+            self._pending = None
+            self._live = None
             return utterance
         return None
+
+    def take_speculative(self) -> tuple[int, bytes] | None:
+        pending, self._pending = self._pending, None
+        return pending
 
     def reset(self) -> None:
         self.speaking = False
         self._buffer = []
+        self._pending = None
+        self._live = None
+        self.committed_speculation = None
         self.resets += 1
 
 
@@ -66,6 +98,9 @@ class _FakeSpeechClient:
         self.transcribe_calls: list[bytes] = []
         self.synthesize_calls: list[str] = []
         self.stt_error: Exception | None = None
+        # Raised by the next transcribe() call only, then cleared: lets a
+        # speculative call fail while the fallback call still succeeds.
+        self.stt_error_once: Exception | None = None
         self.tts_error: Exception | None = None
         self.closed = False
         self.stt_started = threading.Event()
@@ -76,6 +111,9 @@ class _FakeSpeechClient:
         self.stt_started.set()
         if self.stt_release is not None and not self.stt_release.wait(timeout=2.0):
             raise RuntimeError("stt_release was never set")
+        if self.stt_error_once is not None:
+            error, self.stt_error_once = self.stt_error_once, None
+            raise error
         if self.stt_error is not None:
             raise self.stt_error
         return self.transcript
@@ -181,6 +219,97 @@ def test_audio_turn_streams_transcript_reply_and_tts_chunks() -> None:
     assert speech.synthesize_calls == ["테스트 답변입니다."]
     assert chat.calls[0][1] == "지금 앞에 뭐가 보여?"
     assert detector.resets >= 1
+
+
+def test_valid_speculation_is_reused_instead_of_a_second_stt_call() -> None:
+    # The candidate fires two frames in (audio = frames 0-1); the commit on
+    # frame 2 reports it still valid, so the turn must reuse that result and
+    # never transcribe the full utterance.
+    speech = _FakeSpeechClient()
+    chat = _FakeChatClient()
+    detector = _FakeTurnDetector(commit_after=3, speculate_after=2)
+    with TestClient(_audio_app(speech, chat, detector)) as client:
+        with client.websocket_connect("/ws/audio") as websocket:
+            _start_audio(websocket)
+            _drive_turn(websocket)
+
+            assert websocket.receive_json() == {"type": "turn", "duration_ms": 60}
+            assert websocket.receive_json() == {
+                "type": "transcript",
+                "text": "지금 앞에 뭐가 보여?",
+            }
+            assert websocket.receive_json() == {"type": "audio_start"}
+            websocket.receive_bytes()
+            websocket.receive_bytes()
+            end = websocket.receive_json()
+            assert end["type"] == "audio_end"
+            assert end["timings"]["stt_speculative"] == 1
+
+    assert speech.transcribe_calls == [_frame(0) + _frame(1)]
+
+
+def test_stale_speculation_falls_back_to_transcribing_the_full_utterance() -> None:
+    # speculation_valid=False models the user resuming speech after the
+    # candidate fired: the early call ran (and is wasted), but the committed
+    # turn must be transcribed from its full audio.
+    speech = _FakeSpeechClient()
+    chat = _FakeChatClient()
+    detector = _FakeTurnDetector(commit_after=3, speculate_after=2, speculation_valid=False)
+    with TestClient(_audio_app(speech, chat, detector)) as client:
+        with client.websocket_connect("/ws/audio") as websocket:
+            _start_audio(websocket)
+            _drive_turn(websocket)
+
+            assert websocket.receive_json()["type"] == "turn"
+            assert websocket.receive_json()["type"] == "transcript"
+            assert websocket.receive_json() == {"type": "audio_start"}
+            websocket.receive_bytes()
+            websocket.receive_bytes()
+            end = websocket.receive_json()
+            assert end["type"] == "audio_end"
+            assert "stt_speculative" not in end["timings"]
+
+    full_utterance = _frame(0) + _frame(1) + _frame(2)
+    speculative_pcm = _frame(0) + _frame(1)
+    assert sorted(speech.transcribe_calls) == sorted([speculative_pcm, full_utterance])
+
+
+def test_failed_speculation_falls_back_and_the_turn_still_completes() -> None:
+    speech = _FakeSpeechClient()
+    speech.stt_error_once = SpeechServiceError("STT_TIMEOUT", "boom", retryable=True)
+    chat = _FakeChatClient()
+    detector = _FakeTurnDetector(commit_after=3, speculate_after=2)
+    with TestClient(_audio_app(speech, chat, detector)) as client:
+        with client.websocket_connect("/ws/audio") as websocket:
+            _start_audio(websocket)
+            _drive_turn(websocket)
+
+            assert websocket.receive_json()["type"] == "turn"
+            # The speculative call died, the fallback call answered: the turn
+            # flow proceeds as if speculation never happened.
+            assert websocket.receive_json() == {
+                "type": "transcript",
+                "text": "지금 앞에 뭐가 보여?",
+            }
+            assert websocket.receive_json() == {"type": "audio_start"}
+            websocket.receive_bytes()
+            websocket.receive_bytes()
+            end = websocket.receive_json()
+            assert end["type"] == "audio_end"
+            assert "stt_speculative" not in end["timings"]
+
+    assert speech.transcribe_calls == [
+        _frame(0) + _frame(1),  # speculative call (raised)
+        _frame(0) + _frame(1) + _frame(2),  # fallback on the full utterance
+    ]
+
+
+def test_speculative_stt_ms_must_stay_below_silence_ms() -> None:
+    with pytest.raises(ValueError, match="speculative_stt_ms"):
+        _test_config(speculative_stt_ms=700)  # equal to silence_ms: never usable
+    with pytest.raises(ValueError, match="speculative_stt_ms"):
+        _test_config(speculative_stt_ms=-1)
+    assert _test_config(speculative_stt_ms=0).speculative_stt_ms == 0  # disabled
 
 
 def test_audio_start_must_be_a_json_text_message() -> None:

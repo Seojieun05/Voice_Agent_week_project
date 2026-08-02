@@ -115,6 +115,82 @@ def test_max_utterance_ms_forces_the_turn_to_commit() -> None:
     assert detector.speaking is False
 
 
+def test_speculative_candidate_fires_once_and_commit_reports_it_valid() -> None:
+    # Onset on frames 0-2, then 100 ms of silence. The candidate must fire
+    # exactly when the pause crosses speculative_ms=40 (frame 4), carry the
+    # audio up to that point, and stay valid through the commit (frame 7).
+    vad = _ScriptedVad([True, True, True] + [False] * 5)
+    detector = _detector(vad, speculative_ms=40)
+
+    frames = [_frame(index) for index in range(8)]
+    candidates: list[tuple[int, bytes] | None] = []
+    results = []
+    for frame in frames:
+        results.append(detector.feed(frame))
+        candidates.append(detector.take_speculative())
+
+    fired = [candidate for candidate in candidates if candidate is not None]
+    assert fired == [(1, b"".join(frames[:5]))]  # once, audio up to frame 4
+    assert results[7] == b"".join(frames)
+    assert detector.committed_speculation == 1
+
+
+def test_resumed_speech_invalidates_the_candidate_and_a_later_pause_fires_a_new_one() -> None:
+    # Pause -> candidate 1 -> speech resumes -> pause -> candidate 2 -> commit.
+    # Only candidate 2 may be reported valid at commit.
+    vad = _ScriptedVad([True, True, True, False, False, True] + [False] * 5)
+    detector = _detector(vad, speculative_ms=40)
+
+    frames = [_frame(index) for index in range(11)]
+    candidates = []
+    results = []
+    for frame in frames:
+        results.append(detector.feed(frame))
+        candidates.append(detector.take_speculative())
+
+    fired = [candidate for candidate in candidates if candidate is not None]
+    assert [generation for generation, _ in fired] == [1, 2]
+    assert fired[1][1] == b"".join(frames[:8])  # up to the second crossing
+    assert results[10] == b"".join(frames)
+    assert detector.committed_speculation == 2
+
+
+def test_uncollected_candidate_is_dropped_when_speech_resumes() -> None:
+    # The caller never take()s during the pause; once speech resumes the
+    # stale candidate must not surface later.
+    vad = _ScriptedVad([True, True, True, False, False, True, False])
+    detector = _detector(vad, speculative_ms=40)
+
+    for index in range(7):
+        detector.feed(_frame(index))
+
+    assert detector.take_speculative() is None
+
+
+def test_no_candidate_below_min_speech_ms() -> None:
+    # A cough followed by a pause must not spend a speculative STT call.
+    vad = _ScriptedVad([True, True, True] + [False] * 5)
+    detector = _detector(vad, speculative_ms=40, min_speech_ms=250)
+
+    for index in range(8):
+        assert detector.feed(_frame(index)) is None
+        assert detector.take_speculative() is None
+    assert detector.committed_speculation is None
+
+
+def test_speculation_disabled_by_default() -> None:
+    vad = _ScriptedVad([True, True, True] + [False] * 5)
+    detector = _detector(vad)
+
+    results = []
+    for index in range(8):
+        results.append(detector.feed(_frame(index)))
+        assert detector.take_speculative() is None
+
+    assert results[7] is not None  # the turn itself still commits
+    assert detector.committed_speculation is None
+
+
 def test_reset_clears_a_turn_in_progress() -> None:
     vad = _ScriptedVad([True, True, True, True])
     detector = _detector(vad)
