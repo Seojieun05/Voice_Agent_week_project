@@ -230,15 +230,29 @@ Grok 호출이 실패해도 서버와 `/ws/vision` 스트림은 계속 동작한
 | `{ "type": "audio_start" }` | TTS 스트리밍 시작 — 클라이언트는 마이크를 닫는다 |
 | (바이너리) | TTS mp3 청크, 도착 즉시 재생 가능 |
 | `{ "type": "audio_end", "reply": "...", "tool_calls": [...], "timings": {...} }` | 답변 텍스트·도구 목록·단계별 지연(ms: stt/llm/tts_first/tts_total/total) |
+| `{ "type": "interrupted" }` | 끼어들기(barge-in) 확정 — 서버가 응답을 취소했다. 아래 5 참조 |
 | `{ "type": "listening" }` | 마이크를 다시 열어도 됨 |
 
 4. 재생이 **실제로 끝나면** 클라이언트는 `{ "type": "playback_done" }`을 보낸다
-   (전화망의 mark 이벤트에 해당). 서버는 그때까지 수신 오디오를 버리므로,
-   에이전트가 자기 목소리를 듣고 반응하는 에코 루프가 차단된다. 클라이언트도
-   재생 중에는 마이크 전송을 멈추는 것을 권장한다(이중 방어).
+   (전화망의 mark 이벤트에 해당). 서버는 `listening`으로 응답해 마이크 재개를
+   확정한다. 단, 감지기가 사용자 발화 중(barge-in 진행 중)이라고 판단하는 동안
+   도착한 `playback_done`은 완전히 무시된다 — 진행 중인 턴이 리셋되면 안 되기
+   때문이다.
 
-5. 응답 중 도착한 사용자 음성은 버려진다(barge-in 미지원 — 향후 확장).
-   턴 처리 실패(STT/Grok/TTS)는 `error` 메시지 + `listening`으로 통지되며 연결은
+5. **barge-in(끼어들기, 기본 활성)**: 클라이언트는 응답 재생 중에도 PCM
+   프레임을 계속 보낸다. 서버는 응답 중 수신 프레임을 버리지 않고 **에코
+   가드**(VAD 문턱을 `VISION_SERVER_VAD_GUARD_THRESHOLD`로 상향)를 올린 채
+   같은 턴 감지기에 계속 먹인다. 그래도 사용자 발화 시작이 확인되는 순간
+   서버는 `{ "type": "interrupted" }`를 1회 보내고 진행 중이던 응답을
+   취소한다(TTS 릴레이 중단, `audio_end` 없음). 클라이언트는 `interrupted`
+   수신 즉시 재생을 멈추고 버퍼를 버려야 한다. 이후 발화는 일반 턴 흐름
+   (`turn` → `transcript` → 새 응답)으로 이어진다. 2차 에코 방어로, 끼어든
+   턴의 STT 결과가 직전 답변 텍스트와 단어 집합 기준 60% 이상 겹치면 스피커
+   에코로 판정해 chat 호출 없이 `listening`만 보낸다.
+   `VISION_SERVER_BARGE_IN=0`이면 기존 동작(응답 중 수신 오디오 폐기)으로
+   되돌아가며 `interrupted`는 발생하지 않는다.
+
+6. 턴 처리 실패(STT/Grok/TTS)는 `error` 메시지 + `listening`으로 통지되며 연결은
    유지된다. 주요 코드: `STT_TIMEOUT`/`STT_ERROR`/`STT_UNAVAILABLE`,
    `TTS_TIMEOUT`/`TTS_ERROR`/`TTS_UNAVAILABLE`, `/api/chat`과 동일한 chat 계열
    코드, `VOICE_TURN_FAILED`. 연결 수준 오류: `INVALID_START`(close 1008),
@@ -260,7 +274,11 @@ Grok 호출이 실패해도 서버와 `/ws/vision` 스트림은 계속 동작한
 | `VISION_SERVER_PREFIX_MS` | `300` | 발화 시작 전 보존할 오디오 (첫 음절 잘림 방지) |
 | `VISION_SERVER_MIN_SPEECH_MS` | `250` | 실제 음성이 이보다 짧으면 버림 (기침·소음이 API 호출로 이어지는 것 방지) |
 | `VISION_SERVER_VAD_AGGRESSIVENESS` | `2` | webrtcvad 민감도 0(관대)~3(엄격) |
+| `VISION_SERVER_VAD_BACKEND` | `silero` | VAD 백엔드 `silero`/`webrtc` — silero 로드 실패 시 webrtc로 자동 폴백 |
+| `VISION_SERVER_VAD_THRESHOLD` | `0.5` | silero 발화 판정 확률 문턱 (0~1] |
+| `VISION_SERVER_VAD_GUARD_THRESHOLD` | `0.75` | 에코 가드(TTS 재생 중) 상향 문턱 — threshold 이상이어야 한다 |
 | `VISION_SERVER_MAX_UTTERANCE_MS` | `30000` | 발화 최대 길이 — 초과 시 강제 턴 종료 |
+| `VISION_SERVER_BARGE_IN` | `1` | 끼어들기(barge-in) 활성 여부 — `0`/`false`만 비활성(응답 중 수신 오디오 폐기로 복귀) |
 
 STT/TTS는 chat과 같은 `GROK_API_KEY`(또는 `XAI_API_KEY`)와 `GROK_BASE_URL`을 쓴다.
 
@@ -288,6 +306,5 @@ STT/TTS는 chat과 같은 `GROK_API_KEY`(또는 `XAI_API_KEY`)와 `GROK_BASE_URL
 
 ## 향후 확장 (아직 미구현)
 
-- barge-in: 에이전트 응답 중 사용자가 끼어들면 재생을 즉시 멈추고 새 턴으로 처리
 - `/ws/audio` 대화 기억(멀티턴 컨텍스트)
 - 인증/세션 토큰

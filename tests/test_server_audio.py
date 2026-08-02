@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from vision_agent.chat import ChatServiceError
-from vision_agent.server import ServerConfig, create_app
+from vision_agent.server import ServerConfig, _transcript_echo_overlap, create_app
 from vision_agent.voice import FRAME_BYTES, SpeechServiceError
 
 
@@ -29,12 +29,17 @@ class _FakeTurnDetector:
     def __init__(self, commit_after: int = 3) -> None:
         self.commit_after = commit_after
         self.speaking = False
+        self.echo_guard = False
         self.fed: list[bytes] = []
+        # The guard state observed at each feed(): lets tests verify that
+        # response-window frames were heard through the raised anti-echo bar.
+        self.guard_log: list[bool] = []
         self.resets = 0
         self._buffer: list[bytes] = []
 
     def feed(self, frame: bytes) -> bytes | None:
         self.fed.append(frame)
+        self.guard_log.append(self.echo_guard)
         self._buffer.append(frame)
         self.speaking = True
         if len(self._buffer) >= self.commit_after:
@@ -271,19 +276,19 @@ def test_wrong_size_binary_frames_are_ignored() -> None:
     assert len(detector.fed) == 3
 
 
-def test_frames_during_a_response_are_dropped() -> None:
+def test_frames_during_a_response_are_dropped_when_barge_in_is_disabled() -> None:
     speech = _FakeSpeechClient()
     speech.stt_release = threading.Event()
     chat = _FakeChatClient()
     detector = _FakeTurnDetector(commit_after=3)
-    with TestClient(_audio_app(speech, chat, detector)) as client:
+    with TestClient(_audio_app(speech, chat, detector, barge_in_enabled=False)) as client:
         with client.websocket_connect("/ws/audio") as websocket:
             _start_audio(websocket)
             _drive_turn(websocket)
             assert speech.stt_started.wait(timeout=2.0)
 
-            # The response is in flight: these frames must never reach the
-            # detector (that branch becomes barge-in later).
+            # The response is in flight and barge-in is off: these frames
+            # must never reach the detector (the legacy echo defense).
             websocket.send_bytes(_frame(97))
             websocket.send_bytes(_frame(98))
             speech.stt_release.set()
@@ -301,6 +306,159 @@ def test_frames_during_a_response_are_dropped() -> None:
             assert websocket.receive_json() == {"type": "listening"}
 
     assert len(detector.fed) == 3
+
+
+def test_barge_in_cancels_the_response_and_the_interrupting_turn_proceeds() -> None:
+    speech = _FakeSpeechClient()
+    speech.stt_release = threading.Event()
+    chat = _FakeChatClient()
+    detector = _FakeTurnDetector(commit_after=3)
+    with TestClient(_audio_app(speech, chat, detector)) as client:
+        with client.websocket_connect("/ws/audio") as websocket:
+            _start_audio(websocket)
+            _drive_turn(websocket)
+            assert websocket.receive_json()["type"] == "turn"
+            assert speech.stt_started.wait(timeout=2.0)
+
+            # Speech onset while the response is in flight: the server must
+            # confirm the barge-in and cancel the respond task.
+            websocket.send_bytes(_frame(50))
+            assert websocket.receive_json() == {"type": "vad", "speaking": True}
+            assert websocket.receive_json() == {"type": "interrupted"}
+            speech.stt_release.set()  # release the cancelled turn's STT thread
+
+            # The interrupting utterance ends: the cancelled response emits
+            # nothing further (no transcript/audio_end), and a brand-new turn
+            # runs to completion in order.
+            websocket.send_bytes(_frame(51))
+            websocket.send_bytes(_frame(52))
+            assert websocket.receive_json() == {"type": "vad", "speaking": False}
+            assert websocket.receive_json()["type"] == "turn"
+            assert websocket.receive_json()["type"] == "transcript"
+            assert websocket.receive_json()["type"] == "audio_start"
+            websocket.receive_bytes()
+            websocket.receive_bytes()
+            assert websocket.receive_json()["type"] == "audio_end"
+            websocket.send_json({"type": "playback_done"})
+            assert websocket.receive_json() == {"type": "listening"}
+
+    # The first turn was cancelled during STT, so only the interrupting turn
+    # reached the chat client.
+    assert speech.transcribe_calls == [
+        _frame(0) + _frame(1) + _frame(2),
+        _frame(50) + _frame(51) + _frame(52),
+    ]
+    assert len(chat.calls) == 1
+    # Response-window audio was heard through the raised anti-echo bar, and
+    # the guard dropped the moment the barge-in was confirmed.
+    assert detector.guard_log == [False, False, False, True, False, False]
+
+
+def test_barged_in_echo_transcript_skips_the_chat_call() -> None:
+    # STT of the interrupting "speech" returns the very words the agent was
+    # saying: that is the speaker bleeding into the mic, not the user.
+    # 3+ tokens on purpose — shorter transcripts are exempt from the echo
+    # verdict (_ECHO_MIN_TOKENS) so real one-word follow-ups survive.
+    speech = _FakeSpeechClient(transcript="지금 신호가 초록불입니다")
+    chat = _FakeChatClient(answer="지금 신호가 초록불입니다. 길을 건너세요.")
+    detector = _FakeTurnDetector(commit_after=3)
+    with TestClient(_audio_app(speech, chat, detector)) as client:
+        with client.websocket_connect("/ws/audio") as websocket:
+            _start_audio(websocket)
+            _drive_turn(websocket)
+            assert websocket.receive_json()["type"] == "turn"
+            assert websocket.receive_json()["type"] == "transcript"
+            assert websocket.receive_json()["type"] == "audio_start"
+            websocket.receive_bytes()
+            websocket.receive_bytes()
+            assert websocket.receive_json()["type"] == "audio_end"
+
+            # Playback is still running (no playback_done): an "utterance"
+            # made of the reply's own words barges in.
+            websocket.send_bytes(_frame(60))
+            assert websocket.receive_json() == {"type": "vad", "speaking": True}
+            assert websocket.receive_json() == {"type": "interrupted"}
+            websocket.send_bytes(_frame(61))
+            websocket.send_bytes(_frame(62))
+            assert websocket.receive_json() == {"type": "vad", "speaking": False}
+            assert websocket.receive_json()["type"] == "turn"
+            # Echo verdict: no transcript, no chat call — straight back to
+            # listening.
+            assert websocket.receive_json() == {"type": "listening"}
+
+    assert len(speech.transcribe_calls) == 2
+    assert len(chat.calls) == 1
+    assert speech.synthesize_calls == ["지금 신호가 초록불입니다. 길을 건너세요."]
+
+
+def test_playback_done_is_ignored_while_the_user_is_speaking() -> None:
+    speech = _FakeSpeechClient()
+    chat = _FakeChatClient()
+    detector = _FakeTurnDetector(commit_after=3)
+    with TestClient(_audio_app(speech, chat, detector)) as client:
+        with client.websocket_connect("/ws/audio") as websocket:
+            _start_audio(websocket)
+            websocket.send_bytes(_frame(0))  # onset: detector.speaking = True
+            assert websocket.receive_json() == {"type": "vad", "speaking": True}
+
+            # A stray mark mid-utterance must not reset the turn in progress
+            # (after a barge-in the client's player can still emit one).
+            websocket.send_json({"type": "playback_done"})
+
+            websocket.send_bytes(_frame(1))
+            websocket.send_bytes(_frame(2))
+            # Had the mark been honored, a "listening" (and a detector reset,
+            # splitting the turn) would appear here instead.
+            assert websocket.receive_json() == {"type": "vad", "speaking": False}
+            assert websocket.receive_json()["type"] == "turn"
+            assert websocket.receive_json()["type"] == "transcript"
+
+    assert detector.resets == 0
+    assert speech.transcribe_calls == [_frame(0) + _frame(1) + _frame(2)]
+
+
+def test_transcript_echo_overlap_measures_the_transcripts_word_set() -> None:
+    assert _transcript_echo_overlap("앞에 버스가 있어요", "앞에 버스가 있어요") == 1.0
+    # Ratio is over the transcript's words: an echo fragment (3+ tokens) of a
+    # longer reply still scores 1.0.
+    assert (
+        _transcript_echo_overlap("지금 길을 건너세요", "지금 신호가 초록불이니 길을 건너세요")
+        == 1.0
+    )
+    assert _transcript_echo_overlap("앞에 버스가 오나요", "앞에 버스가 있어요") == pytest.approx(
+        2 / 3
+    )
+    # Punctuation must not break matching: the reply carries "있습니다." while
+    # STT yields "있습니다".
+    assert _transcript_echo_overlap("앞에 버스가 있습니다", "앞에 버스가 있습니다.") == 1.0
+    # Short interjections (< 3 tokens) are never judged as echo, even on a
+    # perfect word match — a real "오른쪽?" follow-up must survive.
+    assert _transcript_echo_overlap("오른쪽", "정류장은 오른쪽에 있습니다") == 0.0
+    assert _transcript_echo_overlap("길을 건너세요", "지금 신호가 초록불이니 길을 건너세요") == 0.0
+    # Case-insensitive for Latin fragments in Korean STT output (padded to
+    # three tokens to clear the minimum).
+    assert _transcript_echo_overlap("Bus 정류장 어디에", "bus 정류장") == pytest.approx(2 / 3)
+    # Empty sides can never be judged as echo.
+    assert _transcript_echo_overlap("", "테스트 답변입니다.") == 0.0
+    assert _transcript_echo_overlap("테스트", "") == 0.0
+    assert _transcript_echo_overlap("   ", "   ") == 0.0
+
+
+def test_barge_in_env_var_disables_only_on_zero_or_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert ServerConfig().barge_in_enabled is True
+    for raw_value, expected in (
+        ("0", False),
+        ("false", False),
+        ("FALSE", False),
+        ("1", True),
+        ("typo", True),  # a mistyped value must not silently disable barge-in
+    ):
+        monkeypatch.setenv("VISION_SERVER_BARGE_IN", raw_value)
+        assert ServerConfig.from_environment().barge_in_enabled is expected
+    monkeypatch.delenv("VISION_SERVER_BARGE_IN")
+    assert ServerConfig.from_environment().barge_in_enabled is True
 
 
 def test_stt_failure_sends_error_and_the_connection_recovers() -> None:
