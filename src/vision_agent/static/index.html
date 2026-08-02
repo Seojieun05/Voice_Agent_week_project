@@ -177,10 +177,12 @@ async function start() {
 }
 
 // worklet 블록(128샘플)을 정확한 20 ms 프레임으로 모아 float32 [-1,1] ->
-// int16 LE 변환 후 바이너리로 전송한다.
+// int16 LE 변환 후 바이너리로 전송한다. 재생 중에도 계속 보낸다: 서버가
+// 에코 가드를 올린 채 듣고 있어야 끼어들기(barge-in)가 가능하다. 에코는
+// getUserMedia의 echoCancellation + 서버 쪽 이중 방어가 맡는다.
 let pcmBuf = new Float32Array(0);
 function sendSamples(block) {
-  if (muted || state === "speaking") return;   // 에코 방지의 브라우저 쪽 절반
+  if (muted) return;
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
   const joined = new Float32Array(pcmBuf.length + block.length);
@@ -233,8 +235,14 @@ function handle(msg) {
       pendingTurn && (pendingTurn.transcript = msg.text);
       break;
     case "audio_start":
-      setState("speaking", "응답 중");       // sendSamples의 마이크 게이트도 겸한다
+      setState("speaking", "응답 중");
       startPlayback();
+      break;
+    case "interrupted":
+      // 끼어들기 확정: 서버가 응답을 취소했으니 재생을 즉시 멈춘다.
+      // pendingTurn은 유지 — 이어서 turn/transcript가 새 턴으로 도착한다.
+      stopPlayback();
+      setState("hearing", "말하는 중");
       break;
     case "audio_end":
       Object.assign(pendingTurn ?? {}, {
@@ -302,6 +310,19 @@ function finishPlayback() {
   const player = $("player");
   player.src = URL.createObjectURL(new Blob(blobChunks, { type: "audio/mpeg" }));
   player.play().catch(() => status("자동재생이 차단됨 — 페이지를 클릭한 뒤 다시 말하세요."));
+}
+
+function stopPlayback() {
+  // 끼어들기로 버리는 재생: onended/onerror가 playback_done mark를 보내면
+  // 서버가 진행 중인 턴을 리셋할 수 있으므로 핸들러부터 떼어낸다.
+  const player = $("player");
+  player.onplaying = player.onended = player.onerror = null;
+  player.pause();
+  player.removeAttribute("src");
+  player.load();
+  // MSE 버퍼·청크 큐 폐기: 취소된 응답의 남은 오디오는 재생하지 않는다.
+  chunkQueue = []; blobChunks = []; streamEnded = false;
+  sourceBuf = null; mediaSource = null;
 }
 
 function playbackDone() {

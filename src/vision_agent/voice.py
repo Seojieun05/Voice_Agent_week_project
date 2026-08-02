@@ -116,6 +116,24 @@ class TurnDetector:
         self._onset = deque(maxlen=ONSET_WINDOW)
         self._quiet_ms = 0
         self._speech_ms = 0
+        # Stateful backends (Silero's RNN in vad_backends) must not carry
+        # one turn's state into the next; plain webrtcvad has no reset().
+        vad_reset = getattr(self._vad, "reset", None)
+        if callable(vad_reset):
+            vad_reset()
+
+    @property
+    def echo_guard(self) -> bool:
+        """Whether the VAD currently applies its raised (anti-echo) bar."""
+        return bool(getattr(self._vad, "echo_guard", False))
+
+    @echo_guard.setter
+    def echo_guard(self, value: bool) -> None:
+        # Delegate to backends that support it (vad_backends adapters); a
+        # plain webrtcvad instance (the default constructor path) has no
+        # such knob, so the request is deliberately a no-op there.
+        if hasattr(self._vad, "echo_guard"):
+            self._vad.echo_guard = bool(value)
 
     def feed(self, frame: bytes) -> bytes | None:
         is_speech = bool(self._vad.is_speech(frame, SAMPLE_RATE))

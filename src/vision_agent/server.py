@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
@@ -123,7 +124,17 @@ class ServerConfig:
     prefix_ms: int = 300
     min_speech_ms: int = 250
     vad_aggressiveness: int = 2
+    # VAD backend selection: "silero" (neural, probability threshold) with
+    # automatic fallback to "webrtc" when silero cannot load. The guard
+    # threshold is the raised bar applied while agent TTS may be audible.
+    vad_backend: str = "silero"
+    vad_threshold: float = 0.5
+    vad_guard_threshold: float = 0.75
     max_utterance_ms: int = 30_000
+    # Barge-in: while a response plays, inbound frames keep feeding the
+    # detector (echo-guarded) and user speech onset cancels the response.
+    # False restores the legacy behavior of dropping frames during a response.
+    barge_in_enabled: bool = True
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -166,6 +177,16 @@ class ServerConfig:
             raise ValueError("min_speech_ms must not be negative")
         if not 0 <= self.vad_aggressiveness <= 3:
             raise ValueError("vad_aggressiveness must be between 0 and 3")
+        if self.vad_backend.strip().lower() not in {"silero", "webrtc"}:
+            raise ValueError("vad_backend must be 'silero' or 'webrtc'")
+        for name, value in (
+            ("vad_threshold", self.vad_threshold),
+            ("vad_guard_threshold", self.vad_guard_threshold),
+        ):
+            if not math.isfinite(value) or not 0.0 < value <= 1.0:
+                raise ValueError(f"{name} must be within (0, 1]")
+        if self.vad_guard_threshold < self.vad_threshold:
+            raise ValueError("vad_guard_threshold must not be below vad_threshold")
         if self.max_utterance_ms <= self.silence_ms:
             raise ValueError("max_utterance_ms must be greater than silence_ms")
         if self.debug_frame_dir is not None and not isinstance(self.debug_frame_dir, Path):
@@ -227,7 +248,19 @@ class ServerConfig:
             prefix_ms=_environment_int("VISION_SERVER_PREFIX_MS", 300),
             min_speech_ms=_environment_int("VISION_SERVER_MIN_SPEECH_MS", 250),
             vad_aggressiveness=_environment_int("VISION_SERVER_VAD_AGGRESSIVENESS", 2),
+            vad_backend=os.getenv("VISION_SERVER_VAD_BACKEND", "silero"),
+            vad_threshold=_environment_float("VISION_SERVER_VAD_THRESHOLD", 0.5),
+            vad_guard_threshold=_environment_float(
+                "VISION_SERVER_VAD_GUARD_THRESHOLD",
+                0.75,
+            ),
             max_utterance_ms=_environment_int("VISION_SERVER_MAX_UTTERANCE_MS", 30_000),
+            # Deliberately looser than _environment_bool: only an explicit
+            # "0"/"false" disables barge-in, so a typo cannot silently turn
+            # off the feature the client UX is built around.
+            barge_in_enabled=(
+                os.getenv("VISION_SERVER_BARGE_IN", "1").strip().lower() not in {"0", "false"}
+            ),
         )
 
 
@@ -1171,6 +1204,47 @@ def _default_speech_client_factory() -> "SpeechClientProtocol":
     return GrokSpeechClient.from_environment()
 
 
+# Second echo-defense layer for barge-in (after the raised VAD bar): a
+# barged-in "turn" made mostly of the agent's own words is playback bleeding
+# into the mic, not the user. 0.6 rather than higher because echo transcripts
+# routinely lose a word or two to the guard threshold and STT noise.
+_ECHO_OVERLAP_THRESHOLD = 0.6
+
+# audio_end 후 이 시간 안에 playback_done이 오지 않으면 턴을 강제 종결한다.
+# 답변 재생은 길어야 수십 초다. 짧게 잡으면 정상 재생 중에 마이크를 열어
+# 자기 에코를 받으므로 넉넉하게 둔다.
+PLAYBACK_DONE_TIMEOUT_S = 60.0
+
+
+def _echo_tokens(text: str) -> set[str]:
+    # \w+ tokenization instead of split(): the reply carries punctuation glued
+    # to words ("있습니다.") while STT output does not ("있습니다") — split()
+    # would systematically undercount overlap on exactly the short echoes
+    # where this defense matters most.
+    return set(re.findall(r"\w+", text.casefold()))
+
+
+# Below this many transcript tokens the overlap ratio is too coarse to judge:
+# a one-word follow-up that reuses a reply word ("오른쪽?") scores 1.0, and a
+# genuine question would be silently swallowed right after its own barge-in
+# killed the playback. Letting a rare 1-2 word echo through costs one odd
+# chat call; eating a real question costs the user's trust.
+_ECHO_MIN_TOKENS = 3
+
+
+def _transcript_echo_overlap(transcript: str, reply: str) -> float:
+    """Fraction of the transcript's token set that also appears in the reply.
+
+    Empty inputs and transcripts shorter than [_ECHO_MIN_TOKENS] tokens can
+    never be judged as echo, hence 0.0.
+    """
+    transcript_words = _echo_tokens(transcript)
+    reply_words = _echo_tokens(reply)
+    if len(transcript_words) < _ECHO_MIN_TOKENS or not reply_words:
+        return 0.0
+    return len(transcript_words & reply_words) / len(transcript_words)
+
+
 def _parse_audio_start_message(
     raw_text: str,
     config: ServerConfig,
@@ -1216,15 +1290,23 @@ def create_app(
     speech_client_guard = asyncio.Lock()
 
     def _default_turn_detector() -> "TurnDetectorProtocol":
-        # webrtcvad stays optional for installations that never use audio.
+        # VAD dependencies (silero-vad/webrtcvad) stay optional for
+        # installations that never use audio, hence the local imports.
+        from .vad_backends import create_vad
         from .voice import TurnDetector
 
+        vad = create_vad(
+            server_config.vad_backend,
+            aggressiveness=server_config.vad_aggressiveness,
+            threshold=server_config.vad_threshold,
+            guard_threshold=server_config.vad_guard_threshold,
+        )
         return TurnDetector(
             silence_ms=server_config.silence_ms,
             prefix_ms=server_config.prefix_ms,
             min_speech_ms=server_config.min_speech_ms,
-            vad_aggressiveness=server_config.vad_aggressiveness,
             max_utterance_ms=server_config.max_utterance_ms,
+            vad=vad,
         )
 
     build_turn_detector = turn_detector_factory or _default_turn_detector
@@ -1842,11 +1924,20 @@ def create_app(
             server -> client  <binary>  one encoded TTS chunk (mp3), repeated
             server -> client  {"type": "audio_end", "reply": str,
                                "tool_calls": [...], "timings": {...}}
+            server -> client  {"type": "interrupted"}   (barge-in, see below)
             server -> client  {"type": "listening"} / {"type": "error", ...}
 
-        While a response is in flight, inbound audio is dropped (the client
-        also mutes its mic during playback — belt and suspenders against the
-        agent hearing itself). Barge-in is deliberately out of scope.
+        Barge-in (default): while a response is in flight, inbound frames
+        keep feeding the same turn detector with its echo guard raised (the
+        VAD applies its stricter bar so playback bleed rarely reads as
+        speech). The moment user speech starts anyway, the server sends
+        ``interrupted`` once, cancels the respond task (no ``audio_end``),
+        and the utterance flows into the normal turn pipeline. A second echo
+        defense drops barged-in turns whose transcript is mostly the words
+        of the reply that was playing. ``playback_done`` is ignored while
+        the detector reports speech so the mark of an interrupted playback
+        cannot reset a turn in progress. With ``barge_in_enabled=False``
+        inbound audio is simply dropped during a response (legacy behavior).
         """
         from .voice import FRAME_BYTES, SpeechServiceError
 
@@ -1866,6 +1957,15 @@ def create_app(
         send_lock = asyncio.Lock()
         responding = False
         early_playback_done = False
+        # Barge-in bookkeeping: whether the turn currently accumulating in
+        # the detector started while a response was playing, and the reply
+        # text that was on the speaker then (for the echo overlap check).
+        barged_in = False
+        last_reply: str | None = None
+        # audio_end 전송 시각. playback_done이 오지 않는 클라이언트(중간에 재생을
+        # 끊고 mark를 잃는 등)로부터 responding 상태가 영구 고착되는 것을 막는
+        # 안전망이다 — 프레임이 계속 흐르는 동안만 검사된다.
+        audio_end_at_s: float | None = None
         received_frames = 0
         committed_turns = 0
         audio_session_id: str | None = None
@@ -1890,13 +1990,32 @@ def create_app(
         async def finish_turn() -> None:
             # Reopen the mic: clear the response gate and any partial detector
             # state accumulated before it engaged, then tell the client.
-            nonlocal responding
+            nonlocal responding, last_reply, audio_end_at_s
             responding = False
+            # The reply is off the speaker now: barge-ins after this point are
+            # not echoes of it, so the echo check must disarm. Leaving it set
+            # would compare THINKING-stage barge-ins of later turns against a
+            # reply that finished playing long ago and eat real questions.
+            last_reply = None
+            audio_end_at_s = None
             if detector is not None:
-                detector.reset()
+                # The response window is over, so the anti-echo bar drops
+                # with it (its other exit is the barge-in branch below).
+                detector.echo_guard = False
+                if not detector.speaking:
+                    # Same principle as the playback_done guard: if the user
+                    # has already started talking, resetting would erase their
+                    # onset debounce and prefix — the first syllable dies.
+                    detector.reset()
             await safe_send({"type": "listening"})
 
-        async def respond(session_id: str, utterance: bytes) -> None:
+        async def respond(
+            session_id: str,
+            utterance: bytes,
+            *,
+            barged_in_turn: bool = False,
+            previous_reply: str | None = None,
+        ) -> None:
             """One voice turn: STT -> shared chat flow -> streamed TTS relay.
 
             Every blocking stage runs via asyncio.to_thread: a blocked event
@@ -1904,7 +2023,7 @@ def create_app(
             chunks would pile up in the transport buffer and arrive at the
             client as one lump when the pipeline finished.
             """
-            nonlocal early_playback_done
+            nonlocal early_playback_done, last_reply, audio_end_at_s
             turn_started_at_s = time.perf_counter()
 
             def elapsed_ms() -> int:
@@ -1923,6 +2042,19 @@ def create_app(
                     return
                 if len(transcript) > server_config.max_question_length:
                     transcript = transcript[: server_config.max_question_length]
+                if barged_in_turn and previous_reply is not None:
+                    overlap = _transcript_echo_overlap(transcript, previous_reply)
+                    if overlap >= _ECHO_OVERLAP_THRESHOLD:
+                        # The raised VAD bar let this "turn" through, but its
+                        # words are mostly the reply that was playing: judge
+                        # it as speaker echo, not the user, and skip the chat
+                        # call entirely.
+                        LOGGER.info(
+                            "barge-in turn judged echo overlap=%.2f; dropped",
+                            overlap,
+                        )
+                        await finish_turn()
+                        return
                 await safe_send({"type": "transcript", "text": transcript})
                 LOGGER.info(
                     "voice turn transcribed chars=%s stt_ms=%s",
@@ -1937,6 +2069,10 @@ def create_app(
                     await finish_turn()
                     return
                 answer_text = str(payload.get("answer_text") or "")
+                # Record before the relay, not after: if the user barges in
+                # while this reply is on the speaker, the echo check of the
+                # interrupting turn must compare against *this* text.
+                last_reply = answer_text
 
                 await safe_send({"type": "audio_start"})
                 first_chunk_ms: int | None = None
@@ -1955,6 +2091,7 @@ def create_app(
                         await asyncio.to_thread(closer)
                 timings["tts_total"] = elapsed_ms() - timings["stt"] - timings["llm"]
                 timings["total"] = elapsed_ms()
+                audio_end_at_s = time.perf_counter()
                 await safe_send(
                     {
                         "type": "audio_end",
@@ -2016,7 +2153,10 @@ def create_app(
             audio_session_id = parsed_session_id
 
             try:
-                detector = build_turn_detector()
+                # 스레드로 미룬다: Silero 백엔드는 최초 로드에 torch import(초 단위)
+                # + JIT 워밍업이 걸리는데, 이벤트 루프에서 하면 그동안 /ws/vision
+                # 릴레이와 진행 중인 TTS 스트리밍까지 전부 멈춘다.
+                detector = await asyncio.to_thread(build_turn_detector)
             except Exception:
                 LOGGER.exception("turn detector initialization failed")
                 await safe_send(
@@ -2051,20 +2191,68 @@ def create_app(
 
                 if raw_binary is not None:
                     received_frames += 1
-                    if responding:
-                        continue  # speech during a response is dropped
                     if len(raw_binary) != FRAME_BYTES:
                         continue  # partial frame on connect/teardown; ignore
+                    if (
+                        responding
+                        and audio_end_at_s is not None
+                        and respond_task is not None
+                        and respond_task.done()
+                        and time.perf_counter() - audio_end_at_s > PLAYBACK_DONE_TIMEOUT_S
+                    ):
+                        # audio_end를 보낸 지 한참인데 playback_done이 없다 —
+                        # 클라이언트가 재생을 끊고 mark를 잃은 경우다. 여기서
+                        # 풀어 주지 않으면 responding+echo_guard가 영구 고착된다.
+                        LOGGER.warning("playback_done timeout; releasing the turn")
+                        await finish_turn()
+                    if responding and not server_config.barge_in_enabled:
+                        continue  # legacy mode: speech during a response is dropped
                     was_speaking = detector.speaking
                     utterance = detector.feed(raw_binary)
                     if detector.speaking != was_speaking:
                         if not await safe_send({"type": "vad", "speaking": detector.speaking}):
                             break
+                    if responding and detector.speaking and not was_speaking:
+                        # Barge-in: the user started talking over the agent.
+                        # Cancel the relay now (its CancelledError path only
+                        # re-raises, so no finish_turn/audio_end fires) and
+                        # let the utterance keep accumulating toward a
+                        # normal turn commit.
+                        barged_in = True
+                        responding = False
+                        detector.echo_guard = False
+                        if respond_task is not None:
+                            respond_task.cancel()
+                        if not await safe_send({"type": "interrupted"}):
+                            break
+                    elif barged_in and was_speaking and not detector.speaking and utterance is None:
+                        # The interrupting utterance was discarded (below
+                        # min_speech_ms): the next committed turn is a
+                        # normal one again. The client saw "interrupted" and
+                        # is waiting for the turn flow — close it explicitly
+                        # so the contract's "interrupted is followed by the
+                        # turn flow" holds even on this path.
+                        barged_in = False
+                        if not await safe_send({"type": "listening"}):
+                            break
                     if utterance is not None:
                         responding = True
                         early_playback_done = False
                         committed_turns += 1
-                        respond_task = asyncio.create_task(respond(audio_session_id, utterance))
+                        if server_config.barge_in_enabled:
+                            # Raise the anti-echo bar for the whole response
+                            # window; it drops again in finish_turn or the
+                            # barge-in branch above.
+                            detector.echo_guard = True
+                        respond_task = asyncio.create_task(
+                            respond(
+                                audio_session_id,
+                                utterance,
+                                barged_in_turn=barged_in,
+                                previous_reply=last_reply,
+                            )
+                        )
+                        barged_in = False
                     continue
 
                 if not isinstance(raw_text, str):
@@ -2081,6 +2269,11 @@ def create_app(
                 if message_type == "playback_done":
                     # ≈ a telephony provider's "mark" event: the client's
                     # speaker is actually done, so the mic can reopen.
+                    if detector is not None and detector.speaking:
+                        # A barge-in is in progress: honoring the mark now
+                        # would reset the detector and destroy the turn. The
+                        # turn flow (turn -> transcript -> ...) supersedes it.
+                        continue
                     if respond_task is not None and not respond_task.done():
                         early_playback_done = True
                         continue
