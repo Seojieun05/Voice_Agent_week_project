@@ -64,8 +64,11 @@ class TurnDetectorProtocol(Protocol):
     """Runtime contract used by the audio WebSocket route and its fakes."""
 
     speaking: bool
+    committed_speculation: int | None
 
     def feed(self, frame: bytes) -> bytes | None: ...
+
+    def take_speculative(self) -> tuple[int, bytes] | None: ...
 
     def reset(self) -> None: ...
 
@@ -76,6 +79,16 @@ class TurnDetector:
     ``feed()`` is called with every 20 ms frame while the agent is idle. It
     returns ``None``, or -- the moment the turn ends -- the complete utterance
     as PCM bytes. ``speaking`` reflects whether a turn is in progress.
+
+    Speculative STT support (``speculative_ms`` > 0): when a pause first
+    reaches ``speculative_ms`` of quiet -- well before the ``silence_ms``
+    commit -- the audio so far is exposed once via ``take_speculative()`` as
+    ``(generation, pcm)`` so the caller can start transcribing early. If the
+    user resumes speaking, that candidate is stale; the caller learns which
+    candidate (if any) still matches the committed turn by comparing its
+    generation against ``committed_speculation`` right after ``feed()``
+    returns the utterance. The committed utterance carries extra trailing
+    silence the candidate lacks, which is irrelevant to transcription.
 
     The ``vad`` argument exists for testing: inject a stub with a scripted
     ``is_speech()`` and the state machine becomes fully deterministic.
@@ -89,6 +102,7 @@ class TurnDetector:
         min_speech_ms: int = 250,
         vad_aggressiveness: int = 2,
         max_utterance_ms: int = 30_000,
+        speculative_ms: int = 0,
         vad: object | None = None,
     ) -> None:
         if vad is None:
@@ -101,21 +115,31 @@ class TurnDetector:
         self._prefix_ms = prefix_ms
         self._min_speech_ms = min_speech_ms
         self._max_utterance_ms = max_utterance_ms
+        self._speculative_ms = speculative_ms
         self.speaking = False
+        self.committed_speculation: int | None = None
         self._frames: list[bytes] = []
         self._prefix: deque[bytes] = deque(maxlen=max(1, prefix_ms // FRAME_MS))
         self._onset: deque[bool] = deque(maxlen=ONSET_WINDOW)
         self._quiet_ms = 0
         self._speech_ms = 0
+        # Monotonic across the detector's lifetime (never reset): a stale
+        # candidate from a discarded turn must not collide with a fresh one.
+        self._speculation_generation = 0
+        self._pending_speculation: tuple[int, bytes] | None = None
+        self._live_speculation: int | None = None
         self.reset()
 
     def reset(self) -> None:
         self.speaking = False
+        self.committed_speculation = None
         self._frames = []
         self._prefix = deque(maxlen=max(1, self._prefix_ms // FRAME_MS))
         self._onset = deque(maxlen=ONSET_WINDOW)
         self._quiet_ms = 0
         self._speech_ms = 0
+        self._pending_speculation = None
+        self._live_speculation = None
         # Stateful backends (Silero's RNN in vad_backends) must not carry
         # one turn's state into the next; plain webrtcvad has no reset().
         vad_reset = getattr(self._vad, "reset", None)
@@ -157,8 +181,26 @@ class TurnDetector:
         if is_speech:
             self._speech_ms += FRAME_MS
             self._quiet_ms = 0
+            # The pause did not run to commit: any candidate taken from it is
+            # transcribing a sentence the user is still extending.
+            self._pending_speculation = None
+            self._live_speculation = None
         else:
             self._quiet_ms += FRAME_MS
+            if (
+                self._speculative_ms > 0
+                # First frame crossing the threshold: one candidate per pause.
+                and self._quiet_ms - FRAME_MS < self._speculative_ms <= self._quiet_ms
+                # A pause in something that would be discarded as a cough at
+                # commit must not spend an STT call either.
+                and self._speech_ms >= self._min_speech_ms
+            ):
+                self._speculation_generation += 1
+                self._pending_speculation = (
+                    self._speculation_generation,
+                    b"".join(self._frames),
+                )
+                self._live_speculation = self._speculation_generation
 
         elapsed_ms = len(self._frames) * FRAME_MS
         forced = elapsed_ms >= self._max_utterance_ms
@@ -168,6 +210,7 @@ class TurnDetector:
         utterance = b"".join(self._frames)
         speech_ms = self._speech_ms
         duration_s = elapsed_ms / 1000
+        live_speculation = self._live_speculation
         self.reset()
 
         if speech_ms < self._min_speech_ms:
@@ -175,11 +218,23 @@ class TurnDetector:
             LOGGER.info("[DISCARDED] %d ms of speech below min_speech_ms", speech_ms)
             return None
 
+        # reset() cleared it; re-publish for the turn actually being returned.
+        self.committed_speculation = live_speculation
+
         if forced:
             LOGGER.info("[SPEECH END forced at %.1fs -> pipeline]", duration_s)
         else:
             LOGGER.info("[SPEECH END after %.1fs -> pipeline]", duration_s)
         return utterance
+
+    def take_speculative(self) -> tuple[int, bytes] | None:
+        """One-shot collection of the current speculative candidate.
+
+        Returns ``(generation, pcm)`` the first time it is called after a
+        pause crossed ``speculative_ms``; ``None`` on every other call.
+        """
+        pending, self._pending_speculation = self._pending_speculation, None
+        return pending
 
 
 def wav_bytes(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:

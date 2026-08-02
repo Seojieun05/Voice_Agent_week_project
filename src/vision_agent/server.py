@@ -131,6 +131,12 @@ class ServerConfig:
     vad_threshold: float = 0.5
     vad_guard_threshold: float = 0.75
     max_utterance_ms: int = 30_000
+    # Speculative STT: when a pause first reaches this much quiet (well
+    # before silence_ms commits the turn), transcription of the audio so far
+    # starts early; if the pause runs to commit, the result is reused and the
+    # silence wait overlaps the STT round-trip. If the user resumes speaking,
+    # the early call is wasted. 0 disables. Must stay below silence_ms.
+    speculative_stt_ms: int = 350
     # Barge-in: while a response plays, inbound frames keep feeding the
     # detector (echo-guarded) and user speech onset cancels the response.
     # False restores the legacy behavior of dropping frames during a response.
@@ -189,6 +195,12 @@ class ServerConfig:
             raise ValueError("vad_guard_threshold must not be below vad_threshold")
         if self.max_utterance_ms <= self.silence_ms:
             raise ValueError("max_utterance_ms must be greater than silence_ms")
+        if self.speculative_stt_ms < 0:
+            raise ValueError("speculative_stt_ms must not be negative")
+        if self.speculative_stt_ms >= self.silence_ms:
+            # At silence_ms the turn commits anyway; a candidate fired on the
+            # same frame could never be collected, only mislead tuning.
+            raise ValueError("speculative_stt_ms must be below silence_ms (0 disables)")
         if self.debug_frame_dir is not None and not isinstance(self.debug_frame_dir, Path):
             object.__setattr__(self, "debug_frame_dir", Path(self.debug_frame_dir))
 
@@ -255,6 +267,7 @@ class ServerConfig:
                 0.75,
             ),
             max_utterance_ms=_environment_int("VISION_SERVER_MAX_UTTERANCE_MS", 30_000),
+            speculative_stt_ms=_environment_int("VISION_SERVER_SPECULATIVE_STT_MS", 350),
             # Deliberately looser than _environment_bool: only an explicit
             # "0"/"false" disables barge-in, so a typo cannot silently turn
             # off the feature the client UX is built around.
@@ -1306,6 +1319,7 @@ def create_app(
             prefix_ms=server_config.prefix_ms,
             min_speech_ms=server_config.min_speech_ms,
             max_utterance_ms=server_config.max_utterance_ms,
+            speculative_ms=server_config.speculative_stt_ms,
             vad=vad,
         )
 
@@ -1938,6 +1952,13 @@ def create_app(
         the detector reports speech so the mark of an interrupted playback
         cannot reset a turn in progress. With ``barge_in_enabled=False``
         inbound audio is simply dropped during a response (legacy behavior).
+
+        Speculative STT (``speculative_stt_ms`` > 0): when a pause crosses
+        that threshold the audio so far is transcribed in the background,
+        overlapping the remaining silence wait with the STT round-trip. If
+        the pause runs to commit the result is reused (``timings`` then
+        carries ``stt_speculative: 1``); if the user resumes speaking the
+        early call is discarded. Invisible on the wire either way.
         """
         from .voice import FRAME_BYTES, SpeechServiceError
 
@@ -1957,6 +1978,11 @@ def create_app(
         send_lock = asyncio.Lock()
         responding = False
         early_playback_done = False
+        # Speculative STT bookkeeping: the one in-flight early transcription
+        # and the detector generation it belongs to. Kept as a pair so a
+        # commit can tell whether the finished call transcribed *this* turn.
+        speculative_task: asyncio.Task[str] | None = None
+        speculative_generation: int | None = None
         # Barge-in bookkeeping: whether the turn currently accumulating in
         # the detector started while a response was playing, and the reply
         # text that was on the speaker then (for the echo overlap check).
@@ -1987,6 +2013,20 @@ def create_app(
                 return False
             return True
 
+        async def speculative_transcribe(pcm: bytes) -> str:
+            client = await _speech_client()
+            return await asyncio.to_thread(client.transcribe, pcm)
+
+        def reap_speculation(task: asyncio.Task[str]) -> None:
+            # Mark the exception retrieved even when no commit ever awaits
+            # this task (user resumed speaking), or asyncio logs a "Task
+            # exception was never retrieved" warning at teardown.
+            if task.cancelled():
+                return
+            error = task.exception()
+            if error is not None:
+                LOGGER.info("speculative STT failed: %s", error)
+
         async def finish_turn() -> None:
             # Reopen the mic: clear the response gate and any partial detector
             # state accumulated before it engaged, then tell the client.
@@ -2015,6 +2055,7 @@ def create_app(
             *,
             barged_in_turn: bool = False,
             previous_reply: str | None = None,
+            speculation: asyncio.Task[str] | None = None,
         ) -> None:
             """One voice turn: STT -> shared chat flow -> streamed TTS relay.
 
@@ -2034,7 +2075,21 @@ def create_app(
             await safe_send({"type": "turn", "duration_ms": len(utterance) // 32})
             try:
                 client = await _speech_client()
-                transcript = (await asyncio.to_thread(client.transcribe, utterance)).strip()
+                transcript: str | None = None
+                if speculation is not None:
+                    try:
+                        transcript = (await speculation).strip()
+                        timings["stt_speculative"] = 1
+                    except SpeechServiceError as exc:
+                        # Only the early call died; the audio is still in
+                        # hand, so fall back to a fresh transcription instead
+                        # of failing the turn.
+                        LOGGER.warning(
+                            "speculative STT failed code=%s; transcribing normally",
+                            exc.code,
+                        )
+                if transcript is None:
+                    transcript = (await asyncio.to_thread(client.transcribe, utterance)).strip()
                 timings["stt"] = elapsed_ms()
                 if not transcript:
                     LOGGER.info("voice turn dropped: empty transcript")
@@ -2173,12 +2228,13 @@ def create_app(
             store.register(audio_session_id)
             LOGGER.info(
                 "audio session started session_id=%s silence_ms=%s prefix_ms=%s "
-                "min_speech_ms=%s vad_aggressiveness=%s",
+                "min_speech_ms=%s vad_aggressiveness=%s speculative_stt_ms=%s",
                 audio_session_id,
                 server_config.silence_ms,
                 server_config.prefix_ms,
                 server_config.min_speech_ms,
                 server_config.vad_aggressiveness,
+                server_config.speculative_stt_ms,
             )
             await safe_send({"type": "ready", "session_id": audio_session_id})
 
@@ -2235,10 +2291,34 @@ def create_app(
                         barged_in = False
                         if not await safe_send({"type": "listening"}):
                             break
+                    candidate = detector.take_speculative()
+                    if candidate is not None:
+                        if speculative_task is None or speculative_task.done():
+                            speculative_generation, speculative_pcm = candidate
+                            speculative_task = asyncio.create_task(
+                                speculative_transcribe(speculative_pcm)
+                            )
+                            speculative_task.add_done_callback(reap_speculation)
+                        # else: one early call at a time. An unbounded
+                        # replace-on-every-pause policy could pile blocked
+                        # transcribe() threads up to the executor's limit;
+                        # skipping a candidate only costs its head start.
                     if utterance is not None:
                         responding = True
                         early_playback_done = False
                         committed_turns += 1
+                        # Reuse the early transcription only if it covers this
+                        # exact turn: the generation says the launched call's
+                        # pause is the one that ran to commit uninterrupted.
+                        speculation: asyncio.Task[str] | None = None
+                        if (
+                            speculative_task is not None
+                            and detector.committed_speculation is not None
+                            and speculative_generation == detector.committed_speculation
+                        ):
+                            speculation = speculative_task
+                        speculative_task = None
+                        speculative_generation = None
                         if server_config.barge_in_enabled:
                             # Raise the anti-echo bar for the whole response
                             # window; it drops again in finish_turn or the
@@ -2250,6 +2330,7 @@ def create_app(
                                 utterance,
                                 barged_in_turn=barged_in,
                                 previous_reply=last_reply,
+                                speculation=speculation,
                             )
                         )
                         barged_in = False
@@ -2287,6 +2368,11 @@ def create_app(
                 ):
                     break
         finally:
+            if speculative_task is not None:
+                # Best effort: a transcribe() already running on its thread
+                # cannot be interrupted, but reap_speculation absorbs the
+                # orphaned result either way.
+                speculative_task.cancel()
             cancellation: asyncio.CancelledError | None = None
             if respond_task is not None:
                 respond_task.cancel()
